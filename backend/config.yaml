@@ -1,0 +1,55 @@
+# Rubaih Configuration — Delta Exchange Delta-Hedge Bot
+# ⚠️  Use TESTNET first. Never deploy live without 30+ days paper trading.
+
+exchange:
+  name: "delta_exchange_india"
+  rest_url: "https://api.india.delta.exchange/v2"
+  ws_url: "wss://socket.india.delta.exchange"
+  testnet_rest_url: "https://testnet-api.delta.exchange/v2"
+  testnet_ws_url: "wss://testnet-socket.delta.exchange"
+  use_testnet: true   # ← SET TO FALSE ONLY AFTER PAPER VALIDATION
+
+  # Fee structure (includes 18% GST)
+  maker_fee: 0.0002    # 0.02%
+  taker_fee: 0.00059   # 0.05% + 18% GST ≈ 0.059%
+  options_fee: 0.000354 # 0.03% + 18% GST ≈ 0.0354%
+
+trading:
+  underlying: "BTC"
+  perp_symbol: "BTCUSD"
+
+  # Delta hedge parameters
+  delta_threshold: 0.05        # BTC units — trigger hedge when |delta| > this
+  max_delta: 0.50              # Hard kill-switch limit
+  max_vega: 5000.0             # USD per vol point
+  max_drawdown_pct: 0.05       # 5% session drawdown → halt
+
+  # Cost-aware rebalancing
+  min_hedge_interval_sec: 30
+  cost_buffer_multiplier: 1.5  # Only hedge if benefit > 1.5x cost
+
+  # Order sizing
+  max_order_size_btc: 2.0
+  twap_slices: 3               # For large hedges, split into TWAP
+  twap_interval_sec: 5
+
+risk:
+  kill_switch_on_drawdown: true
+  kill_switch_on_delta_limit: true
+  kill_switch_on_vega_limit: true
+  emergency_flatten: true
+  rate_limit_orders_per_sec: 10
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  jwt_secret: "${JWT_SECRET}"
+  jwt_expiry_hours: 24
+  cors_origins:
+    - "*"   # Lock this down in production to your mobile app domain
+
+logging:
+  level: "INFO"
+  file: "logs/rubaih.log"
+  max_bytes: 10485760   # 10MB
+  backup_count: 5

@@ -1,0 +1,108 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: rubaih_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rubaih
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-rubaih_secret_2026}
+      POSTGRES_DB: rubaih
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - rubaih_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: rubaih_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - rubaih_net
+
+  rubaih_engine:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rubaih_engine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=rubaih
+      - DB_USER=rubaih
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MODE=engine
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./backend:/app
+      - rubaih_logs:/app/logs
+    networks:
+      - rubaih_net
+    command: python -u rubaih_engine.py
+
+  rubaih_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rubaih_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=rubaih
+      - DB_USER=rubaih
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MODE=api
+    depends_on:
+      - postgres
+      - redis
+      - rubaih_engine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - rubaih_logs:/app/logs
+    networks:
+      - rubaih_net
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+  nginx:
+    image: nginx:alpine
+    container_name: rubaih_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - rubaih_api
+    networks:
+      - rubaih_net
+
+volumes:
+  pgdata:
+  redisdata:
+  rubaih_logs:
+
+networks:
+  rubaih_net:
+    driver: bridge
