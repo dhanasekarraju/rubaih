@@ -1,9 +1,7 @@
-name: Build Rubaih APK
+name: Build Rubaih APK (No Expo)
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
     branches: [main, master]
 
 jobs:
@@ -18,25 +16,32 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Setup Expo
-        uses: expo/expo-github-action@v8
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          expo-version: latest
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
+          distribution: 'zulu'
+          java-version: '17'
 
-      - name: Install dependencies
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install React Native dependencies
         run: |
           cd mobile
           npm install
 
-      - name: Build APK with EAS
+      - name: Prebuild Android project
         run: |
           cd mobile
-          eas build --platform android --profile preview --non-interactive
+          npx expo prebuild --platform android
 
-      - name: Upload APK artifact
+      - name: Build Release APK
+        run: |
+          cd mobile/android
+          ./gradlew assembleRelease
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: rubaih-apk
-          path: mobile/*.apk
+          path: mobile/android/app/build/outputs/apk/release/app-release.apk
