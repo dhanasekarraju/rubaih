@@ -147,6 +147,9 @@ class CoinDCXClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.margin = MARGIN_CCY
         self._auth_errors = 0
+        self._auth_ok = False
+        # CoinDCX docs disagree: code samples use ms, some tables say seconds
+        self._ts_mode = "ms"  # "ms" | "s"
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(headers=_HTTP_HEADERS)
@@ -156,8 +159,9 @@ class CoinDCXClient:
         if self.session:
             await self.session.close()
 
-    def _timestamp_ms(self) -> int:
-        # CoinDCX examples use ms (Date.now / time*1000); param tables often mislabel as seconds.
+    def _timestamp(self) -> int:
+        if self._ts_mode == "s":
+            return int(time.time())
         return int(round(time.time() * 1000))
 
     async def _public_get(self, url: str, params: Optional[Dict] = None) -> dict:
@@ -172,9 +176,8 @@ class CoinDCXClient:
                 return {}
 
     async def _signed_post(self, path: str, body: Optional[Dict] = None) -> dict:
-        # timestamp first — matches CoinDCX docs examples; never let caller overwrite it
         extra = {k: v for k, v in dict(body or {}).items() if k != "timestamp"}
-        body = {"timestamp": self._timestamp_ms(), **extra}
+        body = {"timestamp": self._timestamp(), **extra}
         headers, payload = self.auth.sign(body)
         url = f"{REST_URL}{path}"
         async with self.session.post(
@@ -190,22 +193,53 @@ class CoinDCXClient:
                 if self._auth_errors == 1 or self._auth_errors % 30 == 0:
                     print(
                         f"[API ERROR] {path} Cloudflare 403/1010 x{self._auth_errors} — "
-                        "VPS IP may be banned by CoinDCX/Cloudflare (not bad API key format)"
+                        "VPS IP may be banned by CoinDCX/Cloudflare"
                     )
                 return data if isinstance(data, dict) else {}
             if resp.status == 401:
+                self._auth_ok = False
                 self._auth_errors += 1
-                if self._auth_errors == 1 or self._auth_errors % 30 == 0:
+                if self._auth_errors == 1 or self._auth_errors % 60 == 0:
                     print(
                         f"[API ERROR] {path} (401 Invalid credentials) x{self._auth_errors} — "
-                        "check COINDCX_API_KEY/SECRET in .env (no quotes/spaces), "
-                        "futures permission, and recreate engine after editing .env"
+                        "CoinDCX rejected key/secret. Confirm email activation, "
+                        "IP whitelist matches this VPS, recreate engine after .env edit"
                     )
             elif resp.status >= 400:
                 print(f"[API ERROR] {path} ({resp.status}): {data}")
             else:
                 self._auth_errors = 0
+                self._auth_ok = True
             return data if isinstance(data, dict) else {}
+
+    async def verify_credentials(self) -> bool:
+        """Probe /users/info with ms then seconds timestamp. Sets _auth_ok / _ts_mode."""
+        for mode in ("ms", "s"):
+            self._ts_mode = mode
+            data = await self._signed_post("/exchange/v1/users/info", {})
+            # success: dict with coindcx_id / email / first_name etc, not error status
+            if isinstance(data, dict) and data.get("status") != "error" and data.get("code") not in (401, "401"):
+                if data.get("coindcx_id") or data.get("email") or data.get("id") or "first_name" in data:
+                    self._auth_ok = True
+                    print(f"[AUTH] CoinDCX OK (timestamp={mode}): id={data.get('coindcx_id') or data.get('id') or 'ok'}")
+                    return True
+                # Some responses are nested
+                if data and "message" not in data:
+                    self._auth_ok = True
+                    print(f"[AUTH] CoinDCX OK (timestamp={mode}): keys={list(data.keys())[:5]}")
+                    return True
+            print(f"[AUTH] users/info failed with timestamp={mode}: {data}")
+        self._auth_ok = False
+        self._ts_mode = "ms"
+        print(
+            "[AUTH] FAILED — CoinDCX Invalid credentials.\n"
+            "  1) New key must be email-confirmed\n"
+            "  2) Whitelist this VPS public IP exactly\n"
+            "  3) Paste secret shown only once at create (no spaces)\n"
+            "  4) docker compose up -d --force-recreate rubaih_engine\n"
+            "  Dry-run cycle can still run; LIVE orders blocked until auth works."
+        )
+        return False
 
     async def get_active_instruments(self) -> List[str]:
         url = f"{REST_URL}/exchange/v1/derivatives/futures/data/active_instruments"
@@ -228,6 +262,8 @@ class CoinDCXClient:
         return await self._public_get(f"{PUBLIC_URL}/market_data/orderbook", {"pair": pair})
 
     async def get_positions(self, pairs: Optional[str] = None) -> List[Dict]:
+        if not self._auth_ok:
+            return []
         body = {
             "page": "1",
             "size": "100",
@@ -832,6 +868,7 @@ class RubaihBot:
         await self.store.set_engine_status("starting")
         self.client = CoinDCXClient(self.auth)
         await self.client.__aenter__()
+        await self.client.verify_credentials()
 
         instruments = await self.client.get_active_instruments()
         target = CFG["trading"]["perp_symbol"]
