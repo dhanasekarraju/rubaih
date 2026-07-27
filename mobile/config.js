@@ -14,8 +14,8 @@ export function normalizeHost(host) {
   let h = (host || '').trim().replace(/\/+$/, '');
   if (!h) return '';
   if (!/^https?:\/\//i.test(h)) h = `http://${h}`;
-  // strip accidental :8000 — public traffic is nginx :80
-  h = h.replace(/:8000$/, '');
+  // API is localhost-only; never dial :8000 / :8010 from the phone
+  h = h.replace(/:(8000|8010)$/, '');
   return h;
 }
 

@@ -468,8 +468,9 @@ export default function App() {
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Server connection</Text>
                 <Text style={styles.help}>
-                  Tap Edit Connection to type your VPS IP and API token.
-                  Phone talks to nginx on port 80 (not :8000).
+                  Tap Edit Connection to type your VPS host and API token.{"\n"}
+                  Because port 80 is often busy, use: YOUR_IP:8080{"\n"}
+                  Example: 12.34.56.78:8080
                 </Text>
                 <SettingsRow label="Current host" value={(conn.apiHost || '').replace(/^https?:\/\//, '') || 'not set'} />
                 <SettingsRow label="Token set" value={conn.configured ? 'yes' : 'no'} />
@@ -506,8 +507,9 @@ export default function App() {
         <SafeAreaView style={styles.modalRoot}>
           <Text style={styles.modalTitle}>Edit Connection</Text>
           <Text style={styles.help}>
-            Example IP: 12.34.56.78{"\n"}
-            Token: copy RUBAIH_API_TOKEN from VPS .env
+            Example host: 12.34.56.78:8080{"\n"}
+            Token: copy RUBAIH_API_TOKEN from VPS .env{"\n"}
+            (nginx listens on 8080 — not bare port 80 / 8000)
           </Text>
 
           <Text style={styles.inputLabel}>VPS IP or host</Text>
@@ -516,7 +518,7 @@ export default function App() {
             style={styles.input}
             value={hostInput}
             onChangeText={setHostInput}
-            placeholder="12.34.56.78"
+            placeholder="12.34.56.78:8080"
             placeholderTextColor={COLORS.textMuted}
             autoCapitalize="none"
             autoCorrect={false}
