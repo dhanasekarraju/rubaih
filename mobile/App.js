@@ -235,8 +235,19 @@ export default function App() {
   const testConnection = async () => {
     try {
       const next = buildUrls(hostInput, tokenInput);
-      const res = await fetch(`${next.apiUrl}/health`);
-      const data = await res.json();
+      const url = `${next.apiUrl}/health`;
+      const res = await fetch(url);
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        Alert.alert(
+          'Cannot reach VPS',
+          `Got HTML/non-JSON from:\n${url}\n\nHTTP ${res.status}\nBody starts: ${text.slice(0, 80)}\n\nOn VPS run:\ndocker compose ps\ncurl -sS http://127.0.0.1:8080/api/health`
+        );
+        return;
+      }
       Alert.alert(
         res.ok ? 'Reachable' : 'Error',
         `Health: ${data.status}\nDB: ${String(data.db)}\nRedis: ${String(data.redis)}\nLive: ${String(data.live_trading)}`
@@ -244,7 +255,7 @@ export default function App() {
     } catch (e) {
       Alert.alert(
         'Cannot reach VPS',
-        `${String(e.message || e)}\n\nCheck:\n1) nginx up (often port 8080)\n2) firewall allows that port\n3) host is IP:8080 — not :8000`
+        `${String(e.message || e)}\n\nCheck:\n1) nginx up on host port 8080\n2) firewall allows 8080\n3) host is IP:8080 — not :8000`
       );
     }
   };
