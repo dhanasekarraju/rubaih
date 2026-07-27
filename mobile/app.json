@@ -2,7 +2,7 @@
   "expo": {
     "name": "Rubaih",
     "slug": "rubaih",
-    "version": "2.1.0",
+    "version": "2.1.1",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "icon": "./assets/icon.png",
@@ -17,7 +17,7 @@
     },
     "android": {
       "package": "com.rubaih.app",
-      "versionCode": 3,
+      "versionCode": 4,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0d1117"

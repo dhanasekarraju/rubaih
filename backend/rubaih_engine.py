@@ -1,9 +1,10 @@
 """
 ================================================================================
-RUBAIH v2 — CoinDCX Futures Delta-Hedge Bot with OpenRouter AI
+RUBAIH v2 — CoinDCX INR-M Futures Cycle Bot with OpenRouter AI
 ================================================================================
 ⚠️  EDUCATIONAL / RESEARCH PURPOSES ONLY.
     Live CoinDCX trading only — no testnet mode.
+    Default strategy: futures_cycle (flat → buy → sell on B-BTC_USDT).
 ================================================================================
 """
 
@@ -14,9 +15,10 @@ import hashlib
 import hmac
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -34,6 +36,14 @@ from openrouter_ai import OpenRouterAI, AIDecision
 # ==============================================================================
 # CONFIG
 # ==============================================================================
+def _env_secret(name: str) -> str:
+    """Load env value, strip whitespace and surrounding quotes from .env typos."""
+    v = (os.getenv(name) or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
+
+
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f)
 
@@ -41,8 +51,8 @@ REST_URL = CFG["exchange"]["rest_url"].rstrip("/")
 PUBLIC_URL = CFG["exchange"].get("public_url", "https://public.coindcx.com").rstrip("/")
 WS_URL = CFG["exchange"]["ws_url"]
 MARGIN_CCY = CFG["exchange"].get("margin_currency", "USDT")
-API_KEY = os.getenv("COINDCX_API_KEY", "").strip()
-API_SECRET = os.getenv("COINDCX_API_SECRET", "").strip()
+API_KEY = _env_secret("COINDCX_API_KEY")
+API_SECRET = _env_secret("COINDCX_API_SECRET")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
 
 # ==============================================================================
@@ -122,6 +132,7 @@ class CoinDCXClient:
         self.auth = auth
         self.session: Optional[aiohttp.ClientSession] = None
         self.margin = MARGIN_CCY
+        self._auth_errors = 0
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -132,23 +143,35 @@ class CoinDCXClient:
             await self.session.close()
 
     def _timestamp_ms(self) -> int:
+        # CoinDCX examples use ms (Date.now / time*1000); param tables often mislabel as seconds.
         return int(round(time.time() * 1000))
 
     async def _public_get(self, url: str, params: Optional[Dict] = None) -> dict:
         async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            return await resp.json()
+            return await resp.json(content_type=None)
 
     async def _signed_post(self, path: str, body: Optional[Dict] = None) -> dict:
-        body = dict(body or {})
-        body["timestamp"] = self._timestamp_ms()
+        # timestamp first — matches CoinDCX docs examples; never let caller overwrite it
+        extra = {k: v for k, v in dict(body or {}).items() if k != "timestamp"}
+        body = {"timestamp": self._timestamp_ms(), **extra}
         headers, payload = self.auth.sign(body)
         url = f"{REST_URL}{path}"
         async with self.session.post(
             url, data=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
             data = await resp.json(content_type=None)
-            if resp.status >= 400:
+            if resp.status == 401:
+                self._auth_errors += 1
+                if self._auth_errors == 1 or self._auth_errors % 30 == 0:
+                    print(
+                        f"[API ERROR] {path} (401 Invalid credentials) x{self._auth_errors} — "
+                        "check COINDCX_API_KEY/SECRET in .env (no quotes/spaces), "
+                        "futures permission, and recreate engine after editing .env"
+                    )
+            elif resp.status >= 400:
                 print(f"[API ERROR] {path} ({resp.status}): {data}")
+            else:
+                self._auth_errors = 0
             return data
 
     async def get_active_instruments(self) -> List[str]:
@@ -163,8 +186,13 @@ class CoinDCXClient:
         return await self._public_get(url, {"pair": pair, "margin_currency_short_name": self.margin})
 
     async def get_orderbook(self, pair: str) -> Dict:
-        url = f"{PUBLIC_URL}/market_data/orderbook"
-        return await self._public_get(url, {"pair": pair})
+        # Futures book (spot /market_data/orderbook is price→qty dicts too, but wrong market)
+        url = f"{PUBLIC_URL}/market_data/v3/orderbook/{pair}-futures/20"
+        data = await self._public_get(url)
+        if isinstance(data, dict) and (data.get("bids") or data.get("asks")):
+            return data
+        # Fallback spot book for mid price if futures endpoint unavailable
+        return await self._public_get(f"{PUBLIC_URL}/market_data/orderbook", {"pair": pair})
 
     async def get_positions(self, pairs: Optional[str] = None) -> List[Dict]:
         body = {
@@ -178,7 +206,9 @@ class CoinDCXClient:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            return data.get("data", data.get("result", []))
+            if data.get("code") in (401, "401") or data.get("status") == "error":
+                return []
+            return data.get("data", data.get("result", [])) or []
         return []
 
     async def place_order(
@@ -361,6 +391,133 @@ class HedgingStrategist:
         return HedgeSignal(now, 0.0, delta, hedge_size, urgency,
             f"delta={delta:.4f}, cost=${est_cost:.2f}, save=${gamma_save:.2f}", False)
 
+
+# ==============================================================================
+# FUTURES CYCLE STRATEGIST (flat → buy → sell)
+# ==============================================================================
+class FuturesCycleStrategist:
+    """Long-only micro scalper: enter on short momentum, exit TP/SL/timeout."""
+
+    def __init__(self):
+        tcfg = CFG["trading"]
+        scfg = tcfg.get("strategy") or {}
+        self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 120))
+        self.lookback = int(scfg.get("momentum_lookback", 30))
+        self.entry_move_pct = float(scfg.get("entry_move_pct", 0.0015))
+        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.004))
+        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.003))
+        self.max_hold_sec = float(scfg.get("max_hold_sec", 1800))
+        self.allow_short = bool(scfg.get("allow_short", False))
+        self.target_size = float(scfg.get("position_size_btc", tcfg.get("max_order_size_btc", 0.001)))
+        self.capital_inr = float(tcfg.get("capital_inr", 1000))
+        self.leverage = int(tcfg.get("leverage", 10))
+        self.usdt_inr = float(tcfg.get("usdt_inr", 87))
+        self.margin_buffer = float(tcfg.get("margin_buffer", 0.7))
+        self.min_interval = float(tcfg.get("min_hedge_interval_sec", 60))
+        self._last_signal = 0.0
+        self._entry_ts = 0.0
+        self._prices: Deque[float] = deque(maxlen=max(self.lookback + 5, 40))
+
+    def push_price(self, mid: float):
+        if mid and mid > 0:
+            self._prices.append(float(mid))
+
+    def affordable_qty(self, spot: float, min_qty: float) -> float:
+        """Max BTC size from INR capital / leverage / FX, floored to target."""
+        if spot <= 0 or self.usdt_inr <= 0 or self.leverage <= 0:
+            return 0.0
+        usable_inr = self.capital_inr * self.margin_buffer
+        # margin_inr ≈ size * spot_usdt * usdt_inr / leverage
+        max_size = (usable_inr * self.leverage) / (spot * self.usdt_inr)
+        qty = min(self.target_size, max_size)
+        if qty + 1e-12 < min_qty:
+            return 0.0
+        return qty
+
+    def evaluate(
+        self,
+        spot: float,
+        position: Optional[Position],
+        min_qty: float,
+    ) -> Optional[HedgeSignal]:
+        now = time.time()
+        if spot <= 0:
+            return None
+        if now - self._last_signal < self.min_interval:
+            return None
+
+        # ----- manage open long -----
+        if position and position.size > 0:
+            side = (position.side or "buy").lower()
+            entry = position.entry_price or 0.0
+            size = position.size
+            if side == "buy" and entry > 0:
+                if self._entry_ts <= 0:
+                    self._entry_ts = now
+                pnl_pct = (spot - entry) / entry
+                held = now - self._entry_ts
+                if pnl_pct >= self.take_profit_pct:
+                    self._last_signal = now
+                    return HedgeSignal(
+                        now, 0.0, size, -size, "immediate",
+                        f"EXIT_TP: +{pnl_pct:.2%} size={size}", False,
+                    )
+                if pnl_pct <= -self.stop_loss_pct:
+                    self._last_signal = now
+                    return HedgeSignal(
+                        now, 0.0, size, -size, "immediate",
+                        f"EXIT_SL: {pnl_pct:.2%} size={size}", False,
+                    )
+                if held >= self.max_hold_sec:
+                    self._last_signal = now
+                    return HedgeSignal(
+                        now, 0.0, size, -size, "passive",
+                        f"EXIT_TIMEOUT: held={held:.0f}s size={size}", False,
+                    )
+                return None
+            # Unexpected short while allow_short=false → flatten
+            if side == "sell":
+                self._last_signal = now
+                return HedgeSignal(
+                    now, 0.0, -size, size, "immediate",
+                    f"EXIT_FLATTEN_SHORT: size={size}", False,
+                )
+            return None
+
+        # ----- flat: look for long entry -----
+        self._entry_ts = 0.0
+        if now - self._last_signal < self.entry_cooldown:
+            return None
+        if len(self._prices) < max(5, self.lookback // 2):
+            return None
+
+        hist = list(self._prices)
+        look = hist[-self.lookback:] if len(hist) >= self.lookback else hist
+        base = look[0]
+        if base <= 0:
+            return None
+        move = (spot - base) / base
+        if move < self.entry_move_pct:
+            return None
+
+        qty = self.affordable_qty(spot, min_qty)
+        if qty <= 0:
+            if now - self._last_signal > 60:
+                print(
+                    f"[CYCLE] Skip entry — cannot afford min {min_qty} BTC "
+                    f"with ₹{self.capital_inr} @ {self.leverage}x (spot={spot:.1f})"
+                )
+                self._last_signal = now
+            return None
+
+        self._last_signal = now
+        self._entry_ts = now
+        return HedgeSignal(
+            now, qty, 0.0, qty, "passive",
+            f"ENTRY_LONG: move={move:.2%} size={qty}", False,
+        )
+
+
 # ==============================================================================
 # RISK MANAGER
 # ==============================================================================
@@ -513,6 +670,7 @@ class RubaihBot:
         self.pricing = PricingEngine()
         self.portfolio = PortfolioRiskEngine(self.pricing)
         self.strategist = HedgingStrategist()
+        self.cycle = FuturesCycleStrategist()
         self.risk = RiskManager()
         self.store = DataStore()
         self.ai = OpenRouterAI()
@@ -521,8 +679,10 @@ class RubaihBot:
         self._running = False
         self._ai_enabled = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
         self._hedge_history: List[Dict] = []
-        self._leverage = int(CFG["trading"].get("leverage", 5))
+        self._leverage = int(CFG["trading"].get("leverage", 10))
         self._live = LIVE_TRADING
+        self._mode = str(CFG["trading"].get("mode", "futures_cycle")).strip().lower()
+        self._dry_pos: Optional[Position] = None  # simulated fill when LIVE_TRADING=false
 
     def _round_qty(self, size: float, product: CoinDCXProduct) -> float:
         step = product.quantity_increment or 0.001
@@ -536,12 +696,13 @@ class RubaihBot:
     async def _seed_settings(self):
         cfg = CFG["trading"]
         defaults = {
+            "mode": self._mode,
             "delta_threshold": str(cfg["delta_threshold"]),
             "max_delta": str(cfg["max_delta"]),
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 0)),
-            "leverage": str(cfg.get("leverage", 5)),
+            "leverage": str(cfg.get("leverage", 10)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
             "margin_currency": MARGIN_CCY,
@@ -551,9 +712,15 @@ class RubaihBot:
         if not existing:
             await self.store.rd.hset("rubaih:settings", mapping=defaults)
         else:
+            # Ensure mode/capital keys exist for mobile even on older Redis hashes
+            patch = {k: v for k, v in defaults.items() if k not in existing}
+            if patch:
+                await self.store.rd.hset("rubaih:settings", mapping=patch)
             await self._apply_settings(existing)
 
     async def _apply_settings(self, data: Dict):
+        if "mode" in data and data["mode"]:
+            self._mode = str(data["mode"]).strip().lower()
         if "delta_threshold" in data:
             self.strategist.delta_threshold = float(data["delta_threshold"])
         if "max_delta" in data:
@@ -562,9 +729,16 @@ class RubaihBot:
             self.risk.max_vega = float(data["max_vega"])
         if "max_drawdown_pct" in data:
             self.risk.max_dd = float(data["max_drawdown_pct"])
-        print(f"[SETTINGS] Applied: threshold={self.strategist.delta_threshold} "
-              f"max_delta={self.risk.max_delta} max_vega={self.risk.max_vega} max_dd={self.risk.max_dd}")
-
+        if "capital_inr" in data:
+            self.cycle.capital_inr = float(data["capital_inr"])
+        if "leverage" in data:
+            self._leverage = int(float(data["leverage"]))
+            self.cycle.leverage = self._leverage
+        print(
+            f"[SETTINGS] mode={self._mode} threshold={self.strategist.delta_threshold} "
+            f"max_delta={self.risk.max_delta} max_vega={self.risk.max_vega} "
+            f"max_dd={self.risk.max_dd} capital_inr={self.cycle.capital_inr} lev={self._leverage}"
+        )
     async def command_listener(self):
         """Honor kill-switch / settings from authenticated API."""
         pubsub = self.store.rd.pubsub()
@@ -605,6 +779,8 @@ class RubaihBot:
         print("[RUBAIH] Bootstrapping CoinDCX...")
         if not API_KEY or not API_SECRET:
             raise RuntimeError("COINDCX_API_KEY and COINDCX_API_SECRET are required")
+        masked = f"{API_KEY[:4]}…{API_KEY[-4:]}" if len(API_KEY) >= 8 else "(short)"
+        print(f"[RUBAIH] CoinDCX key: {masked} (len={len(API_KEY)}, secret_len={len(API_SECRET)})")
         if not os.getenv("DB_PASSWORD"):
             print("[WARN] DB_PASSWORD is empty — ensure compose/.env is configured")
 
@@ -657,24 +833,35 @@ class RubaihBot:
         self.pricing.update_surface("BTC", 0.55, -0.15, 0.08)
         self.pricing.update_surface("ETH", 0.60, -0.18, 0.10)
         print(f"[RUBAIH] Loaded {len(self.products)} CoinDCX instruments")
+        print(f"[RUBAIH] Mode: {self._mode}")
         print(f"[RUBAIH] Hedge pair: {target}")
         print(f"[RUBAIH] AI augmentation: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
         print(f"[RUBAIH] LIVE_TRADING: {'ON — real orders' if self._live else 'OFF — dry-run only'}")
         print(f"[RUBAIH] Capital target: ₹{CFG['trading'].get('capital_inr', '?')} INR-M @ {self._leverage}x")
         print(f"[RUBAIH] Margin currency: {MARGIN_CCY}")
+        prod = self.products.get(target)
+        spot_guess = 100000.0
+        min_q = prod.min_quantity if prod else 0.001
+        afford = self.cycle.affordable_qty(spot_guess, min_q)
+        print(
+            f"[RUBAIH] Cycle size estimate @ {spot_guess:.0f} USDT: "
+            f"{afford if afford else 'NONE (raise leverage or capital)'} BTC (min={min_q})"
+        )
         await self.store.set_engine_status("running" if self._live else "dry_run")
 
     async def ws_listener(self):
-        """CoinDCX public socket.io orderbook stream for hedge pair."""
+        """CoinDCX public socket.io orderbook stream for hedge pair (futures channel)."""
         pair = CFG["trading"]["perp_symbol"]
-        channel = f"{pair}@orderbook@20"
+        # Spot: {pair}@orderbook@20 — Futures: {pair}@orderbook@20-futures
+        channel = f"{pair}@orderbook@20-futures"
+        self._ob_parse_errors = 0
 
         while self._running:
             sio = socketio.AsyncClient(logger=False, engineio_logger=False)
             try:
                 @sio.event
                 async def connect():
-                    print(f"[WS] Connected to CoinDCX stream")
+                    print(f"[WS] Connected — joining {channel}")
                     await sio.emit("join", {"channelName": channel})
 
                 @sio.on("depth-snapshot")
@@ -697,6 +884,48 @@ class RubaihBot:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _best_prices(bids, asks) -> Tuple[float, float]:
+        """CoinDCX books are usually {price_str: qty_str} maps; also support [[p,q],...]."""
+
+        def from_map(levels, want_max: bool) -> float:
+            prices = []
+            for p in levels.keys():
+                try:
+                    prices.append(float(p))
+                except (TypeError, ValueError):
+                    continue
+            if not prices:
+                return 0.0
+            return max(prices) if want_max else min(prices)
+
+        def from_list(levels, want_max: bool) -> float:
+            prices = []
+            for level in levels:
+                try:
+                    if isinstance(level, (list, tuple)):
+                        prices.append(float(level[0]))
+                    elif isinstance(level, dict):
+                        prices.append(float(level.get("price") or level.get("p") or 0))
+                    else:
+                        prices.append(float(level))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    continue
+            if not prices:
+                return 0.0
+            return max(prices) if want_max else min(prices)
+
+        def best(levels, want_max: bool) -> float:
+            if not levels:
+                return 0.0
+            if isinstance(levels, dict):
+                return from_map(levels, want_max)
+            if isinstance(levels, list):
+                return from_list(levels, want_max)
+            return 0.0
+
+        return best(bids, True), best(asks, False)
+
     async def _on_orderbook(self, pair: str, data):
         try:
             payload = data
@@ -704,29 +933,23 @@ class RubaihBot:
                 payload = data["data"]
             if isinstance(payload, str):
                 payload = json.loads(payload)
+            if not isinstance(payload, dict):
+                return
 
-            bids = payload.get("bids") or payload.get("b") or []
-            asks = payload.get("asks") or payload.get("a") or []
-
-            def top_price(levels):
-                if not levels:
-                    return 0.0
-                level = levels[0]
-                if isinstance(level, (list, tuple)):
-                    return float(level[0])
-                if isinstance(level, dict):
-                    return float(level.get("price") or level.get("p") or 0)
-                return float(level)
-
-            bid = top_price(bids)
-            ask = top_price(asks)
+            bids = payload.get("bids") or payload.get("b") or {}
+            asks = payload.get("asks") or payload.get("a") or {}
+            bid, ask = self._best_prices(bids, asks)
             if bid > 0 and ask > 0:
                 mid = (bid + ask) / 2
                 prod = self.products.get(pair)
                 if prod:
                     self.portfolio.update_spot(prod.underlying, mid)
+                self.cycle.push_price(mid)
+                self._ob_parse_errors = 0
         except Exception as e:
-            print(f"[WS] Orderbook parse error: {e}")
+            self._ob_parse_errors = getattr(self, "_ob_parse_errors", 0) + 1
+            if self._ob_parse_errors <= 3 or self._ob_parse_errors % 100 == 0:
+                print(f"[WS] Orderbook parse error ({type(e).__name__}): {e!r}")
 
     async def price_poller(self):
         """REST orderbook fallback if socket drops."""
@@ -740,25 +963,42 @@ class RubaihBot:
             await asyncio.sleep(2)
 
     async def sync_positions(self):
+        """Sync only the configured hedge pair — never ingest SLX / other books."""
+        target = CFG["trading"]["perp_symbol"]
         while self._running:
             try:
-                raw = await self.client.get_positions(pairs=CFG["trading"]["perp_symbol"])
-                # Also pull all if filtered call returns empty structure issues
+                # Dry-run cycle: keep simulated position; refresh mark/PnL only
+                if not self._live and self._mode == "futures_cycle" and self._dry_pos:
+                    spot = self.portfolio.spot_prices.get(CFG["trading"]["underlying"], 0.0)
+                    if spot > 0 and self._dry_pos.entry_price > 0:
+                        direction = 1.0 if self._dry_pos.side == "buy" else -1.0
+                        self._dry_pos.unrealized_pnl = (
+                            (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
+                        )
+                    self.portfolio.update_positions([self._dry_pos])
+                    await asyncio.sleep(10)
+                    continue
+
+                raw = await self.client.get_positions(pairs=target)
                 if not raw:
                     raw = await self.client.get_positions()
 
                 positions = []
                 for rp in raw:
+                    pair = rp.get("pair", "")
+                    if pair and pair != target:
+                        continue
                     active = float(rp.get("active_pos", 0) or 0)
                     if active == 0:
                         continue
-                    pair = rp.get("pair", "")
+                    if not pair:
+                        pair = target
                     side = "buy" if active > 0 else "sell"
                     mark = float(rp.get("mark_price", 0) or 0)
                     avg = float(rp.get("avg_price", 0) or 0)
                     if mark > 0 and pair in self.products:
                         self.portfolio.update_spot(self.products[pair].underlying, mark)
-                    # Approximate unrealized PnL
+                        self.cycle.push_price(mark)
                     upnl = 0.0
                     if mark > 0 and avg > 0:
                         upnl = (mark - avg) * active
@@ -820,6 +1060,7 @@ class RubaihBot:
             await asyncio.sleep(60)
 
     async def main_loop(self):
+        target = CFG["trading"]["perp_symbol"]
         while self._running and self.risk.alive:
             try:
                 greeks = self.portfolio.compute_greeks()
@@ -838,10 +1079,19 @@ class RubaihBot:
                     await self._emergency_unwind()
                     break
 
-                signal = self.strategist.evaluate(greeks, spot)
-                if signal and signal.hedge_size != 0:
-                    print(f"[HEDGE] {signal.reason}")
-                    await self._execute_hedge(signal)
+                if self._mode == "futures_cycle":
+                    pos = self.portfolio.positions.get(target) or self._dry_pos
+                    prod = self.products.get(target)
+                    min_q = prod.min_quantity if prod else 0.001
+                    signal = self.cycle.evaluate(spot, pos, min_q)
+                    if signal and signal.hedge_size != 0:
+                        print(f"[CYCLE] {signal.reason}")
+                        await self._execute_hedge(signal)
+                else:
+                    signal = self.strategist.evaluate(greeks, spot)
+                    if signal and signal.hedge_size != 0:
+                        print(f"[HEDGE] {signal.reason}")
+                        await self._execute_hedge(signal)
             except Exception as e:
                 print(f"[LOOP] Error: {e}")
             await asyncio.sleep(1)
@@ -871,6 +1121,7 @@ class RubaihBot:
             if not self._live:
                 print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
                 await self.store.save_hedge(signal, spot)
+                self._apply_dry_fill(perp_symbol, side, qty, spot)
                 return True
             result = await self.client.place_order(perp_prod.pair, side, qty, "market", self._leverage)
             print(f"[HEDGE] LIVE order: {result}")
@@ -890,6 +1141,37 @@ class RubaihBot:
             qty = self._round_qty(size, perp_prod)
             await _place(qty)
 
+    def _apply_dry_fill(self, symbol: str, side: Side, qty: float, price: float):
+        """Simulate position so futures_cycle can exercise exits in dry-run."""
+        if self._mode != "futures_cycle" or qty <= 0:
+            return
+        pos = self._dry_pos
+        if side == Side.BUY:
+            if pos and pos.side == "buy":
+                new_size = pos.size + qty
+                pos.entry_price = ((pos.entry_price * pos.size) + price * qty) / new_size
+                pos.size = new_size
+            else:
+                self._dry_pos = Position(
+                    symbol=symbol, product_id=f"dry-{symbol}", side="buy",
+                    size=qty, entry_price=price, unrealized_pnl=0.0,
+                )
+        else:  # SELL
+            if pos and pos.side == "buy":
+                remain = pos.size - qty
+                if remain <= 1e-12:
+                    self._dry_pos = None
+                    self.cycle._entry_ts = 0.0
+                else:
+                    pos.size = remain
+            else:
+                # opening short not used in long-only; clear
+                self._dry_pos = None
+        if self._dry_pos:
+            self.portfolio.update_positions([self._dry_pos])
+        else:
+            self.portfolio.update_positions([])
+
     async def _emergency_unwind(self):
         print("[EMERGENCY] Flattening...")
         try:
@@ -906,6 +1188,7 @@ class RubaihBot:
                 "emergency", "EMERGENCY_UNWIND", False,
             )
             await self._execute_hedge(signal, force=True)
+        self._dry_pos = None
         self._running = False
         await self.store.set_engine_status("stopped")
 
@@ -915,9 +1198,10 @@ class RubaihBot:
         print("\n" + "=" * 60)
         print("  RUBAIH v2")
         print("  Exchange: CoinDCX")
-        print(f"  Mode: {'LIVE ORDERS' if self._live else 'DRY-RUN (set LIVE_TRADING=true)'}")
+        print(f"  Strategy: {self._mode}")
+        print(f"  Orders: {'LIVE' if self._live else 'DRY-RUN (set LIVE_TRADING=true)'}")
         print(f"  Underlying: {CFG['trading']['underlying']}")
-        print(f"  Hedge pair: {CFG['trading']['perp_symbol']}")
+        print(f"  Pair: {CFG['trading']['perp_symbol']}")
         print(f"  AI: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
         print("=" * 60 + "\n")
 

@@ -1,6 +1,6 @@
-# Rubaih Configuration — CoinDCX Futures Delta-Hedge Bot
-# Sized for ~₹1000 INR-M capital (micro account).
-# Note: BTC mins are large vs ₹1k — keep leverage modest and sizes at exchange min.
+# Rubaih Configuration — CoinDCX INR-M Futures Cycle Bot
+# Sized for ~₹1000 free futures margin (micro account).
+# Ignores other pairs (e.g. locked SLX). Live only when LIVE_TRADING=true.
 
 exchange:
   name: "coindcx"
@@ -18,15 +18,20 @@ trading:
   underlying: "BTC"
   perp_symbol: "B-BTC_USDT"
 
+  # flat → buy → sell cycle (not options / not pure delta-hedge)
+  mode: futures_cycle
+
   # Account sizing — ₹1000 INR margin wallet
   capital_inr: 1000
-  leverage: 5                    # Needed so min BTC size can fit; still careful
+  leverage: 10                   # Needed so ~0.001 BTC min can fit in ₹1k
+  usdt_inr: 87                   # Sizing FX only
+  margin_buffer: 0.7             # Use 70% of capital for margin estimate
 
-  # Delta in BTC units — micro: 0.001 BTC ≈ one typical min lot
+  # Delta limits (also cap absolute position size in cycle mode)
   delta_threshold: 0.0005
   max_delta: 0.002               # Kill if exposure > ~2 min lots
   max_vega: 100.0
-  max_drawdown_pct: 0.15         # ~₹150 session DD halt (small book = noisy)
+  max_drawdown_pct: 0.15         # Halt on ~15% HWM drawdown
 
   min_hedge_interval_sec: 60
   cost_buffer_multiplier: 1.2
@@ -35,6 +40,16 @@ trading:
   max_order_size_btc: 0.001
   twap_slices: 1
   twap_interval_sec: 5
+
+  strategy:
+    entry_cooldown_sec: 120
+    momentum_lookback: 30        # price samples (~2s poll → ~1 min)
+    entry_move_pct: 0.0015       # 0.15% up to enter long
+    take_profit_pct: 0.004       # 0.4%
+    stop_loss_pct: 0.003         # 0.3%
+    max_hold_sec: 1800           # 30 min
+    allow_short: false
+    position_size_btc: 0.001
 
 risk:
   kill_switch_on_drawdown: true

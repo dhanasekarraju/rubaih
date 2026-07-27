@@ -223,7 +223,7 @@ export default function App() {
       setTokenInput(next.apiToken);
       setConn(next);
       setEditOpen(false);
-      Alert.alert('Saved', `Connecting via nginx:\n${next.apiHost}\n\nUse port 80 (no :8000).`);
+      Alert.alert('Saved', `Connecting via nginx:\n${next.apiHost}\n\nUse host:port of nginx (often :8080). Do not use :8000/:8010.`);
       setActiveTab('dashboard');
     } catch (e) {
       Alert.alert('Save failed', String(e.message || e));
@@ -244,7 +244,7 @@ export default function App() {
     } catch (e) {
       Alert.alert(
         'Cannot reach VPS',
-        `${String(e.message || e)}\n\nCheck:\n1) nginx is up on port 80\n2) firewall allows 80\n3) IP is correct (no :8000)`
+        `${String(e.message || e)}\n\nCheck:\n1) nginx up (often port 8080)\n2) firewall allows that port\n3) host is IP:8080 — not :8000`
       );
     }
   };
@@ -283,9 +283,14 @@ export default function App() {
     return typeof n === 'number' ? n.toFixed(digits) : n;
   };
 
-  const formatCurrency = (n) => {
+  // BTC futures marks are USDT-quoted; account capital / session PnL shown as INR.
+  const formatInr = (n) => {
     if (n === undefined || n === null) return '—';
-    return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return '₹' + Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+  const formatUsdt = (n) => {
+    if (n === undefined || n === null) return '—';
+    return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USDT';
   };
 
   const fmtSetting = (v, suffix = '') => {
@@ -310,7 +315,7 @@ export default function App() {
       <View style={styles.header}>
         <View style={styles.headerLeft}>
           <Text style={styles.headerTitle}>Rubaih</Text>
-          <Text style={styles.headerSubtitle}>CoinDCX · Futures Delta-Hedge</Text>
+          <Text style={styles.headerSubtitle}>CoinDCX · INR-M Futures Hedge</Text>
         </View>
         <View style={styles.headerRight}>
           <Animated.View style={[styles.pulseDot, { transform: [{ scale: pulseAnim }] }]}>
@@ -360,9 +365,9 @@ export default function App() {
 
               {dashboard && (
                 <View style={styles.heroCard}>
-                  <Text style={styles.heroLabel}>BTC Spot</Text>
-                  <Text style={styles.heroPrice}>{formatCurrency(dashboard.spot_price)}</Text>
-                  <Text style={styles.pnlLine}>Session PnL: {formatCurrency(dashboard.session_pnl)}</Text>
+                  <Text style={styles.heroLabel}>BTC Mark (USDT)</Text>
+                  <Text style={styles.heroPrice}>{formatUsdt(dashboard.spot_price)}</Text>
+                  <Text style={styles.pnlLine}>Session PnL: {formatInr(dashboard.session_pnl)}</Text>
                   <View style={styles.heroRow}>
                     <View style={[styles.badge, {
                       backgroundColor: dashboard.live_trading ? COLORS.redDim : COLORS.cyanDim,
@@ -396,8 +401,8 @@ export default function App() {
                     icon="Δ"
                   />
                   <GreekCard label="Gamma" value={formatNumber(dashboard.gamma, 6)} color={COLORS.purple} icon="Γ" />
-                  <GreekCard label="Vega" value={formatNumber(dashboard.vega, 2)} unit=" $/vol" color={COLORS.cyan} icon="V" />
-                  <GreekCard label="Theta" value={formatNumber(dashboard.theta, 2)} unit=" $/day" color={COLORS.orange} icon="Θ" />
+                  <GreekCard label="Vega" value={formatNumber(dashboard.vega, 2)} unit=" /vol" color={COLORS.cyan} icon="V" />
+                  <GreekCard label="Theta" value={formatNumber(dashboard.theta, 2)} unit=" /day" color={COLORS.orange} icon="Θ" />
                 </View>
               )}
 
@@ -433,7 +438,7 @@ export default function App() {
                     </Text>
                   </View>
                   <Text style={styles.tradeSize}>{Number(h.size).toFixed(4)} BTC</Text>
-                  <Text style={styles.tradePrice}>{formatCurrency(h.price)}</Text>
+                  <Text style={styles.tradePrice}>{formatUsdt(h.price)}</Text>
                   {h.ai_augmented ? <Text style={styles.aiBadge}>AI</Text> : null}
                 </View>
               ))}
@@ -484,11 +489,12 @@ export default function App() {
 
               <View style={styles.card}>
                 <Text style={styles.cardTitle}>Bot Settings (from server · read-only)</Text>
+                <SettingsRow label="Mode" value={fmtSetting(settings?.mode || 'futures_cycle')} />
                 <SettingsRow label="Capital" value={fmtSetting(settings?.capital_inr, ' INR')} />
                 <SettingsRow label="Margin" value={fmtSetting(settings?.margin_currency || 'INR')} />
                 <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
                 <SettingsRow label="Exchange" value="CoinDCX" />
-                <SettingsRow label="Hedge Pair" value={fmtSetting(settings?.perp_symbol || 'B-BTC_USDT')} />
+                <SettingsRow label="Pair" value={fmtSetting(settings?.perp_symbol || 'B-BTC_USDT')} />
                 <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
                 <SettingsRow label="Delta Threshold" value={fmtSetting(settings?.delta_threshold, ' BTC')} />
                 <SettingsRow label="Max Delta" value={fmtSetting(settings?.max_delta, ' BTC')} />
