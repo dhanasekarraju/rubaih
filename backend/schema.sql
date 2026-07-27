@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS ai_decisions (
     portfolio_delta NUMERIC
 );
 
-CREATE INDEX idx_greeks_timestamp ON greeks_snapshots(timestamp DESC);
-CREATE INDEX idx_hedges_timestamp ON hedge_trades(timestamp DESC);
-CREATE INDEX idx_ai_timestamp ON ai_decisions(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_greeks_timestamp ON greeks_snapshots(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_hedges_timestamp ON hedge_trades(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_timestamp ON ai_decisions(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_timestamp ON risk_events(timestamp DESC);

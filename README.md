@@ -1,108 +1,75 @@
-# 🤖 Rubaih — Delta-Hedge Bot for Delta Exchange India
+# 🤖 Rubaih — CoinDCX Futures Delta-Hedge Bot
 
-> **⚠️ EDUCATIONAL / RESEARCH PURPOSES ONLY.**
-> Test on Delta Exchange Testnet for minimum 30 days before live capital.
+> **Educational / research software. Live trading can lose money.**
+> Default mode is **dry-run**. Real orders require `LIVE_TRADING=true`.
 
-## What is Rubaih?
+## Production checklist
 
-Rubaih is a professional-grade crypto options delta-hedge bot built for **Delta Exchange India**. It combines:
-
-- **Quantitative engine**: Smile-adjusted Black-Scholes Greeks, cost-aware rebalancing
-- **AI augmentation**: OpenRouter free-tier models (Nemotron, Llama, Qwen) for strategy overlay
-- **Mobile control panel**: React Native app with real-time WebSocket streaming
-- **Docker deployment**: One-command VPS setup with PostgreSQL + Redis
+1. Copy `.env.example` → `.env`
+2. Set `COINDCX_API_KEY` / `COINDCX_API_SECRET` (futures trade permission, IP whitelist if possible)
+3. Set strong `DB_PASSWORD` and `RUBAIH_API_TOKEN` (`openssl rand -hex 32`)
+4. Deploy with `sudo bash setup-vps.sh`
+5. Confirm dry-run logs look correct (`docker compose logs -f rubaih_engine`)
+6. Only then set `LIVE_TRADING=true` and `docker compose up -d --force-recreate rubaih_engine rubaih_api`
+7. Build APK after `mobile/config.js` has your VPS IP + same API token
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Mobile App │────▶│  FastAPI    │────▶│   Engine    │
-│  (React Nat)│◀────│  (VPS:8000) │◀────│  (Python)   │
-└─────────────┘     └─────────────┘     └──────┬──────┘
-                                                │
-                    ┌─────────────┐     ┌──────▼──────┐
-                    │  PostgreSQL │◀────▶│    Redis    │
-                    │  (Ledger)   │     │  (Pub/Sub)  │
-                    └─────────────┘     └─────────────┘
-                                                │
-                                          ┌─────▼─────┐
-                                          │  OpenRouter│
-                                          │  (Free AI) │
-                                          └───────────┘
+Mobile (token) → Nginx :80 → FastAPI → Redis/Postgres
+                              ↑
+                         Rubaih engine → CoinDCX futures
 ```
 
-## Quick Start
+## Safety controls
 
-### 1. Clone & Configure
+| Control | Behavior |
+|---------|----------|
+| `LIVE_TRADING` | Must be `true` for real CoinDCX orders; otherwise dry-run logs only |
+| `RUBAIH_API_TOKEN` | Required on all API routes except `/api/health`; WS needs `?token=` |
+| Kill switch | Authenticated POST → Redis command → engine halt + flatten |
+| Risk limits | max delta / vega / drawdown → emergency unwind |
+| API bind | FastAPI published on `127.0.0.1:8000` only; public via nginx `:80` |
+
+## Quick deploy
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rubaih.git
-cd rubaih
 cp .env.example .env
-# Edit .env with your Delta Exchange TESTNET keys and OpenRouter API key
+# edit secrets…
+sudo bash setup-vps.sh
 ```
 
-### 2. Deploy on VPS
+Public endpoints after deploy:
 
-```bash
-docker-compose up -d --build
-```
+- `http://YOUR_IP/api/health` (open)
+- `http://YOUR_IP/api/dashboard` (requires `X-API-Token`)
+- `ws://YOUR_IP/ws?token=YOUR_TOKEN`
 
-### 3. Mobile App
+## Mobile / APK
+
+Set GitHub Actions secrets for a ready-to-install APK:
+
+- `MOBILE_API_HOST` — e.g. `http://YOUR_VPS_IP`
+- `MOBILE_API_TOKEN` — same value as `RUBAIH_API_TOKEN`
+
+Or run the workflow manually with those inputs.
 
 ```bash
 cd mobile
+# config.js must have API_HOST + API_TOKEN (setup-vps patches these on the VPS)
 npm install
-# Update API_URL in App.js with your VPS IP
-npx expo start
-# Or build APK:
-eas build --platform android --profile preview
+# GitHub Actions builds APK on push to main, or:
+npx expo prebuild --platform android
+cd android && ./gradlew assembleRelease
 ```
 
-## OpenRouter AI Integration
+## CoinDCX
 
-Rubaih uses OpenRouter's **free-tier models** for AI-augmented trading decisions:
-
-| Model | Role | Cost |
-|-------|------|------|
-| `nvidia/nemotron-3-ultra:free` | Deep strategy analysis | $0 |
-| `nvidia/nemotron-3-super:free` | Multi-step reasoning | $0 |
-| `meta-llama/llama-4-maverick:free` | General trading logic | $0 |
-| `qwen/qwen3-coder:free` | Structured JSON output | $0 |
-
-**Rate limits**: 20 req/min, 1000 req/day (after $10 deposit on OpenRouter)
-
-The AI provides a **qualitative overlay** on top of the quantitative Greeks engine — it does not replace math, it augments it.
-
-## File Structure
-
-```
-rubaih/
-├── docker-compose.yml
-├── .env.example
-├── nginx.conf
-├── backend/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── config.yaml
-│   ├── schema.sql
-│   ├── rubaih_engine.py    # Main trading bot
-│   ├── openrouter_ai.py    # AI decision engine
-│   └── api.py              # FastAPI backend
-├── mobile/
-│   ├── App.js              # React Native app
-│   └── package.json
-└── .github/workflows/
-    └── build-apk.yml       # CI/CD for APK
-```
-
-## Delta Exchange India
-
-- **REST API**: `https://api.india.delta.exchange/v2`
-- **WebSocket**: `wss://socket.india.delta.exchange`
-- **Testnet**: Available for paper trading
-- **Fees**: 0.03% options + 18% GST (~0.0354% per side)
+- REST: `https://api.coindcx.com`
+- Public: `https://public.coindcx.com`
+- Stream: `https://stream.coindcx.com`
+- Default hedge pair: `B-BTC_USDT`
 
 ## License
 
-MIT — Educational use only. Not financial advice.
+MIT — not financial advice.

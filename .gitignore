@@ -13,10 +13,12 @@ env/
 venv/
 .venv/
 
-# Node
+# Node / Expo / Android native
 node_modules/
 .expo/
 dist/
+mobile/android/
+mobile/ios/
 
 # Docker
 *.log

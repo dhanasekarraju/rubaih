@@ -1,84 +1,134 @@
 #!/bin/bash
 # ============================================
-# Rubaih VPS Deployment Script
+# Rubaih VPS Production Setup
 # ============================================
-# Run this on your VPS after cloning the repo
+set -euo pipefail
 
-set -e
+echo "Rubaih VPS Setup (CoinDCX production)"
+echo "======================================"
 
-echo "🤖 Rubaih VPS Setup"
-echo "===================="
-
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo "⚠️  Please run as root or with sudo"
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "Please run as root or with sudo"
     exit 1
 fi
 
-# Get VPS IP
-VPS_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{print $1}')
-echo "📡 Your VPS IP: $VPS_IP"
+VPS_IP=$(curl -fsS ifconfig.me || curl -fsS icanhazip.com || hostname -I | awk '{print $1}')
+echo "VPS IP: $VPS_IP"
 
-# Update nginx.conf with actual IP
-echo "📝 Updating nginx.conf with your VPS IP..."
+echo "Updating nginx.conf server_name..."
 sed -i "s/YOUR_VPS_IP_OR_DOMAIN/$VPS_IP/g" nginx.conf
 
-# Install Docker if not present
-if ! command -v docker &> /dev/null; then
-    echo "🐳 Installing Docker..."
+if [ ! -f .env ]; then
+    echo "Creating .env from .env.example..."
+    cp .env.example .env
+    TOKEN=$(openssl rand -hex 32)
+    DBPASS=$(openssl rand -hex 16)
+    sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$DBPASS/" .env
+    sed -i "s/^RUBAIH_API_TOKEN=.*/RUBAIH_API_TOKEN=$TOKEN/" .env
+    echo ""
+    echo "Generated DB_PASSWORD and RUBAIH_API_TOKEN in .env"
+    echo "NOW edit .env and set:"
+    echo "  COINDCX_API_KEY / COINDCX_API_SECRET"
+    echo "  LIVE_TRADING=true   (only when ready for real orders)"
+    echo "  OPENROUTER_API_KEY  (optional)"
+    echo ""
+    echo "Then re-run: sudo bash setup-vps.sh"
+    echo "Token for mobile/config.js:"
+    grep '^RUBAIH_API_TOKEN=' .env
+    exit 0
+fi
+
+# Validate required secrets
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
+
+if [ -z "${COINDCX_API_KEY:-}" ] || [ -z "${COINDCX_API_SECRET:-}" ]; then
+    echo "ERROR: Set COINDCX_API_KEY and COINDCX_API_SECRET in .env"
+    exit 1
+fi
+if [ -z "${RUBAIH_API_TOKEN:-}" ] || [ "${#RUBAIH_API_TOKEN}" -lt 16 ]; then
+    echo "ERROR: RUBAIH_API_TOKEN must be set (>=16 chars)"
+    exit 1
+fi
+if [ -z "${DB_PASSWORD:-}" ]; then
+    echo "ERROR: DB_PASSWORD must be set"
+    exit 1
+fi
+
+# Patch mobile config for APK builds on this machine / CI checkout
+if [ -f mobile/config.js ]; then
+    echo "Patching mobile/config.js with VPS IP + API token..."
+    python3 - <<PY
+from pathlib import Path
+p = Path("mobile/config.js")
+text = p.read_text()
+text = text.replace("http://YOUR_VPS_IP", "http://${VPS_IP}")
+text = text.replace("YOUR_RUBAIH_API_TOKEN", """${RUBAIH_API_TOKEN}""")
+p.write_text(text)
+print("mobile/config.js updated")
+PY
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Installing Docker..."
     curl -fsSL https://get.docker.com | sh
     systemctl enable docker
     systemctl start docker
 fi
 
-# Install Docker Compose if not present
-if ! command -v docker-compose &> /dev/null; then
-    echo "🐳 Installing Docker Compose..."
-    curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+    echo "Installing Docker Compose plugin fallback..."
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+      -o /usr/local/bin/docker-compose
     chmod +x /usr/local/bin/docker-compose
 fi
 
-# Create .env if not exists
-if [ ! -f .env ]; then
-    echo "⚙️  Creating .env file..."
-    cp .env.example .env
-    echo "⚠️  IMPORTANT: Edit .env and add your Delta Exchange API keys!"
-    echo "   nano .env"
+COMPOSE="docker compose"
+if ! docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker-compose"
 fi
 
-# Create required directories
-mkdir -p logs certbot/conf certbot/www
+mkdir -p logs
 
-# Pull and build
-echo "🏗️  Building Rubaih..."
-docker-compose pull
-docker-compose build
+echo "Building and starting services..."
+$COMPOSE build
+$COMPOSE up -d
 
-# Start services
-echo "🚀 Starting Rubaih services..."
-docker-compose up -d
-
-# Wait for services
-echo "⏳ Waiting for services to start..."
-sleep 10
-
-# Check health
-echo "🏥 Health check..."
-curl -s http://localhost:8000/api/health || echo "⚠️  API not responding yet (may need more time)"
+echo "Waiting for API health..."
+ok=0
+for i in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:8000/api/health" >/dev/null 2>&1; then
+        ok=1
+        break
+    fi
+    sleep 2
+done
 
 echo ""
-echo "✅ Rubaih deployed!"
-echo "===================="
-echo "API URL:    http://$VPS_IP:8000/api"
-echo "WebSocket:  ws://$VPS_IP:8000/ws"
-echo "Nginx:      http://$VPS_IP (port 80)"
+if [ "$ok" -eq 1 ]; then
+    echo "API healthy"
+else
+    echo "API not healthy yet — check: $COMPOSE logs -f rubaih_api"
+fi
+
 echo ""
-echo "📱 Update your mobile app API_URL to: http://$VPS_IP:8000/api"
-echo "📱 Update your mobile app WS_URL to:  ws://$VPS_IP:8000/ws"
+echo "Deployed"
+echo "========"
+echo "Public API:  http://$VPS_IP/api"
+echo "WebSocket:   ws://$VPS_IP/ws?token=***"
+echo "Local API:   http://127.0.0.1:8000/api"
 echo ""
-echo "📋 Useful commands:"
-echo "   docker-compose logs -f rubaih_engine    # Watch trading bot"
-echo "   docker-compose logs -f rubaih_api       # Watch API"
-echo "   docker-compose ps                       # Check status"
-echo "   docker-compose down                     # Stop all"
-echo "   docker-compose up -d --build            # Rebuild & restart"
+echo "LIVE_TRADING=${LIVE_TRADING:-false}"
+if [ "${LIVE_TRADING:-false}" != "true" ]; then
+    echo "DRY-RUN mode — no real CoinDCX orders until LIVE_TRADING=true"
+fi
+echo ""
+echo "Mobile: mobile/config.js was patched with this VPS IP + token."
+echo "Rebuild APK after pull, or copy config.js into your build machine."
+echo ""
+echo "Useful:"
+echo "  $COMPOSE logs -f rubaih_engine"
+echo "  $COMPOSE logs -f rubaih_api"
+echo "  $COMPOSE ps"

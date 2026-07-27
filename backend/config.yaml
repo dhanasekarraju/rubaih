@@ -1,22 +1,23 @@
-# Rubaih Configuration — Delta Exchange Delta-Hedge Bot
-# ⚠️  Use TESTNET first. Never deploy live without 30+ days paper trading.
+# Rubaih Configuration — CoinDCX Futures Delta-Hedge Bot
+# ⚠️  EDUCATIONAL / RESEARCH PURPOSES ONLY. Live trading only — no testnet.
 
 exchange:
-  name: "delta_exchange_india"
-  rest_url: "https://api.india.delta.exchange/v2"
-  ws_url: "wss://socket.india.delta.exchange"
-  testnet_rest_url: "https://testnet-api.delta.exchange/v2"
-  testnet_ws_url: "wss://testnet-socket.delta.exchange"
-  use_testnet: true   # ← SET TO FALSE ONLY AFTER PAPER VALIDATION
+  name: "coindcx"
+  rest_url: "https://api.coindcx.com"
+  public_url: "https://public.coindcx.com"
+  ws_url: "https://stream.coindcx.com"
 
-  # Fee structure (includes 18% GST)
-  maker_fee: 0.0002    # 0.02%
-  taker_fee: 0.00059   # 0.05% + 18% GST ≈ 0.059%
-  options_fee: 0.000354 # 0.03% + 18% GST ≈ 0.0354%
+  # Futures margin mode: USDT or INR
+  margin_currency: "USDT"
+
+  # Fee structure (fractions — CoinDCX futures typically ~0.025% / 0.075%)
+  maker_fee: 0.00025
+  taker_fee: 0.00075
 
 trading:
   underlying: "BTC"
-  perp_symbol: "BTCUSD"
+  perp_symbol: "B-BTC_USDT"
+  leverage: 5
 
   # Delta hedge parameters
   delta_threshold: 0.05        # BTC units — trigger hedge when |delta| > this
@@ -28,9 +29,9 @@ trading:
   min_hedge_interval_sec: 30
   cost_buffer_multiplier: 1.5  # Only hedge if benefit > 1.5x cost
 
-  # Order sizing
-  max_order_size_btc: 2.0
-  twap_slices: 3               # For large hedges, split into TWAP
+  # Order sizing — keep small for live capital tests
+  max_order_size_btc: 0.25
+  twap_slices: 3
   twap_interval_sec: 5
 
 risk:

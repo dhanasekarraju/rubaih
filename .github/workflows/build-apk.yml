@@ -1,8 +1,18 @@
-name: Build Rubaih APK (No Expo)
+name: Build Rubaih APK (No Expo EAS)
 
 on:
   push:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      api_host:
+        description: "API host URL e.g. http://1.2.3.4 (no trailing slash)"
+        required: false
+        default: ""
+      api_token:
+        description: "RUBAIH_API_TOKEN (leave empty to use secrets.MOBILE_API_TOKEN)"
+        required: false
+        default: ""
 
 jobs:
   build-apk:
@@ -25,7 +35,35 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install React Native dependencies
+      - name: Inject mobile runtime config
+        env:
+          API_HOST: ${{ github.event.inputs.api_host || secrets.MOBILE_API_HOST }}
+          API_TOKEN: ${{ github.event.inputs.api_token || secrets.MOBILE_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          host = (os.environ.get("API_HOST") or "").strip().rstrip("/")
+          token = (os.environ.get("API_TOKEN") or "").strip()
+          p = Path("mobile/config.js")
+          text = p.read_text()
+          if host:
+              # normalize: ensure scheme
+              if not host.startswith("http"):
+                  host = "http://" + host
+              text = text.replace("http://YOUR_VPS_IP", host)
+              print(f"Injected API_HOST={host}")
+          else:
+              print("WARNING: MOBILE_API_HOST not set — APK will use placeholder host")
+          if token:
+              text = text.replace("YOUR_RUBAIH_API_TOKEN", token)
+              print("Injected API_TOKEN")
+          else:
+              print("WARNING: MOBILE_API_TOKEN not set — APK will use placeholder token")
+          p.write_text(text)
+          PY
+
+      - name: Install dependencies
         run: |
           cd mobile
           npm install
@@ -33,15 +71,40 @@ jobs:
       - name: Prebuild Android project
         run: |
           cd mobile
-          npx expo prebuild --platform android
+          npx expo prebuild --platform android --non-interactive
+
+      - name: Use debug keystore for CI release APK
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("mobile/android/app/build.gradle")
+          if not p.exists():
+              raise SystemExit(f"missing {p}")
+          text = p.read_text()
+          if "signingConfig signingConfigs.debug" in text:
+              print("Signing already configured")
+          else:
+              text2, n = re.subn(
+                  r"(release\s*\{)",
+                  r"\1\n            signingConfig signingConfigs.debug",
+                  text,
+                  count=1,
+              )
+              if not n:
+                  raise SystemExit("Could not patch release signingConfig")
+              p.write_text(text2)
+              print("Patched release signingConfig → debug")
+          PY
 
       - name: Build Release APK
         run: |
           cd mobile/android
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: rubaih-apk
-          path: mobile/android/app/build/outputs/apk/release/app-release.apk
+          path: mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error

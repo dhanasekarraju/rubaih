@@ -20,6 +20,10 @@ import time
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import aiohttp
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -72,7 +76,7 @@ class OpenRouterAI:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://rubaih-bot.local",
-            "X-Title": "Rubaih Delta Hedge Bot"
+            "X-Title": "Rubaih CoinDCX Hedge Bot"
         }
 
         payload = {
@@ -118,7 +122,7 @@ class OpenRouterAI:
             return None
         self._last_call = now
 
-        system_prompt = """You are Rubaih, an elite crypto options delta-hedge strategist. 
+        system_prompt = """You are Rubaih, an elite crypto futures delta-hedge strategist on CoinDCX.
 You analyze portfolio Greeks and market microstructure to make hedging decisions.
 
 Respond ONLY in valid JSON with this exact structure:
@@ -132,7 +136,7 @@ Respond ONLY in valid JSON with this exact structure:
 
 Rules:
 - HEDGE only when delta drift is meaningful AND market conditions support it
-- HOLD when transaction costs would exceed gamma P&L benefit
+- HOLD when transaction costs would exceed expected P&L benefit
 - ADJUST_THRESHOLD when vol regime is changing
 - EMERGENCY only for extreme tail risks (IV spike >50%, liquidation cascade)
 - Confidence >0.8 required for HEDGE, >0.95 for EMERGENCY
