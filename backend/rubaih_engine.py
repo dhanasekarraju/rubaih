@@ -428,8 +428,14 @@ class DataStore:
         self.rd = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6379")),
-            decode_responses=True
+            decode_responses=True,
+            lib_name=None,
+            lib_version=None,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True,
         )
+        await self.rd.ping()
         await self._init_tables()
 
     async def _init_tables(self):

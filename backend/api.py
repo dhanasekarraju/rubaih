@@ -53,6 +53,11 @@ async def lifespan(app: FastAPI):
         host=os.getenv("REDIS_HOST", "localhost"),
         port=int(os.getenv("REDIS_PORT", "6379")),
         decode_responses=True,
+        lib_name=None,
+        lib_version=None,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+        retry_on_timeout=True,
     )
     await rd_client.ping()
     yield

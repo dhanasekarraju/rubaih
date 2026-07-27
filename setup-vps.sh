@@ -99,7 +99,7 @@ $COMPOSE up -d
 echo "Waiting for API health..."
 ok=0
 for i in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:8000/api/health" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:8010/api/health" >/dev/null 2>&1; then
         ok=1
         break
     fi
@@ -118,15 +118,14 @@ echo "Deployed"
 echo "========"
 echo "Public API:  http://$VPS_IP/api"
 echo "WebSocket:   ws://$VPS_IP/ws?token=***"
-echo "Local API:   http://127.0.0.1:8000/api"
+echo "Local API:   http://127.0.0.1:8010/api"
 echo ""
 echo "LIVE_TRADING=${LIVE_TRADING:-false}"
 if [ "${LIVE_TRADING:-false}" != "true" ]; then
     echo "DRY-RUN mode — no real CoinDCX orders until LIVE_TRADING=true"
 fi
 echo ""
-echo "Mobile: mobile/config.js was patched with this VPS IP + token."
-echo "Rebuild APK after pull, or copy config.js into your build machine."
+echo "Mobile: Settings → Edit Connection → VPS IP ($VPS_IP) + RUBAIH_API_TOKEN"
 echo ""
 echo "Useful:"
 echo "  $COMPOSE logs -f rubaih_engine"
