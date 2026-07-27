@@ -112,6 +112,19 @@ class Position:
 # ==============================================================================
 # COINDCX CLIENT
 # ==============================================================================
+# Cloudflare on api.coindcx.com blocks bare Python UA (error 1010). Look like a normal client.
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://coindcx.com",
+    "Referer": "https://coindcx.com/",
+}
+
+
 class CoinDCXAuth:
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
@@ -121,6 +134,7 @@ class CoinDCXAuth:
         payload = json.dumps(body, separators=(",", ":"))
         signature = hmac.new(self.api_secret, payload.encode(), hashlib.sha256).hexdigest()
         headers = {
+            **_HTTP_HEADERS,
             "Content-Type": "application/json",
             "X-AUTH-APIKEY": self.api_key,
             "X-AUTH-SIGNATURE": signature,
@@ -135,7 +149,7 @@ class CoinDCXClient:
         self._auth_errors = 0
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(headers=_HTTP_HEADERS)
         return self
 
     async def __aexit__(self, *args):
@@ -148,7 +162,14 @@ class CoinDCXClient:
 
     async def _public_get(self, url: str, params: Optional[Dict] = None) -> dict:
         async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            return await resp.json(content_type=None)
+            text = await resp.text()
+            if resp.status == 403 and "1010" in text:
+                print(f"[API ERROR] Cloudflare blocked GET {url} (1010) — VPS IP or UA banned")
+                return {}
+            try:
+                return json.loads(text) if text else {}
+            except Exception:
+                return {}
 
     async def _signed_post(self, path: str, body: Optional[Dict] = None) -> dict:
         # timestamp first — matches CoinDCX docs examples; never let caller overwrite it
@@ -159,7 +180,19 @@ class CoinDCXClient:
         async with self.session.post(
             url, data=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
-            data = await resp.json(content_type=None)
+            text = await resp.text()
+            try:
+                data = json.loads(text) if text else {}
+            except Exception:
+                data = {"raw": text[:200]}
+            if resp.status == 403 and ("1010" in text or "cloudflare" in text.lower()):
+                self._auth_errors += 1
+                if self._auth_errors == 1 or self._auth_errors % 30 == 0:
+                    print(
+                        f"[API ERROR] {path} Cloudflare 403/1010 x{self._auth_errors} — "
+                        "VPS IP may be banned by CoinDCX/Cloudflare (not bad API key format)"
+                    )
+                return data if isinstance(data, dict) else {}
             if resp.status == 401:
                 self._auth_errors += 1
                 if self._auth_errors == 1 or self._auth_errors % 30 == 0:
@@ -172,7 +205,7 @@ class CoinDCXClient:
                 print(f"[API ERROR] {path} ({resp.status}): {data}")
             else:
                 self._auth_errors = 0
-            return data
+            return data if isinstance(data, dict) else {}
 
     async def get_active_instruments(self) -> List[str]:
         url = f"{REST_URL}/exchange/v1/derivatives/futures/data/active_instruments"
