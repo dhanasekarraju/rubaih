@@ -22,10 +22,11 @@ trading:
   mode: futures_cycle
 
   # Account sizing — ₹1000 INR margin wallet
+  # 0.001 BTC @ ~100k USDT ≈ ₹8700 notional → margin ≈ ₹8700/leverage
   capital_inr: 1000
-  leverage: 10                   # Needed so ~0.001 BTC min can fit in ₹1k
+  leverage: 15                   # ~₹580 margin for 0.001 BTC (fits in ₹1k)
   usdt_inr: 87                   # Sizing FX only
-  margin_buffer: 0.7             # Use 70% of capital for margin estimate
+  margin_buffer: 0.85            # Leave headroom for fees/funding
 
   # Delta limits (also cap absolute position size in cycle mode)
   delta_threshold: 0.0005

@@ -712,7 +712,7 @@ class RubaihBot:
         self._running = False
         self._ai_enabled = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
         self._hedge_history: List[Dict] = []
-        self._leverage = int(CFG["trading"].get("leverage", 10))
+        self._leverage = int(CFG["trading"].get("leverage", 15))
         self._live = LIVE_TRADING
         self._mode = str(CFG["trading"].get("mode", "futures_cycle")).strip().lower()
         self._dry_pos: Optional[Position] = None  # simulated fill when LIVE_TRADING=false
@@ -735,21 +735,31 @@ class RubaihBot:
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 0)),
-            "leverage": str(cfg.get("leverage", 10)),
+            "leverage": str(cfg.get("leverage", 15)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
             "margin_currency": MARGIN_CCY,
             "perp_symbol": cfg["perp_symbol"],
         }
+        # Always refresh sizing/mode from config.yaml so stale Redis (e.g. lev=5) cannot block entries
+        force_keys = ("mode", "capital_inr", "leverage", "perp_symbol", "margin_currency", "live_trading")
         existing = await self.store.rd.hgetall("rubaih:settings")
-        if not existing:
-            await self.store.rd.hset("rubaih:settings", mapping=defaults)
-        else:
-            # Ensure mode/capital keys exist for mobile even on older Redis hashes
-            patch = {k: v for k, v in defaults.items() if k not in existing}
-            if patch:
-                await self.store.rd.hset("rubaih:settings", mapping=patch)
-            await self._apply_settings(existing)
+        merged = dict(existing or {})
+        merged.update(defaults)  # config wins for all defaults we care about
+        await self.store.rd.hset("rubaih:settings", mapping={k: merged[k] for k in defaults})
+        # Apply Redis risk knobs if present, but keep forced sizing from config
+        await self._apply_settings(merged)
+        for k in force_keys:
+            if k == "leverage":
+                self._leverage = int(float(defaults["leverage"]))
+                self.cycle.leverage = self._leverage
+            elif k == "capital_inr":
+                self.cycle.capital_inr = float(defaults["capital_inr"])
+            elif k == "mode":
+                self._mode = str(defaults["mode"]).strip().lower()
+        self.cycle.margin_buffer = float(cfg.get("margin_buffer", 0.85))
+        self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
+        print(f"[SETTINGS] Forced from config: mode={self._mode} capital=₹{self.cycle.capital_inr} lev={self._leverage}x")
 
     async def _apply_settings(self, data: Dict):
         if "mode" in data and data["mode"]:

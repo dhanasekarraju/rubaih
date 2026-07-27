@@ -289,7 +289,7 @@ async def get_settings():
             "max_vega": "100.0",
             "max_drawdown_pct": "0.15",
             "capital_inr": "1000",
-            "leverage": "10",
+            "leverage": "15",
             "live_trading": str(LIVE_TRADING).lower(),
             "exchange": "coindcx",
             "margin_currency": "INR",
