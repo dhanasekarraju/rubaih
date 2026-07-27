@@ -534,10 +534,11 @@ class RubaihBot:
             "max_delta": str(cfg["max_delta"]),
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
-            "capital_usdt": str(cfg.get("capital_usdt", 0)),
-            "leverage": str(cfg.get("leverage", 2)),
+            "capital_inr": str(cfg.get("capital_inr", 0)),
+            "leverage": str(cfg.get("leverage", 5)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
+            "margin_currency": MARGIN_CCY,
             "perp_symbol": cfg["perp_symbol"],
         }
         existing = await self.store.rd.hgetall("rubaih:settings")
@@ -653,7 +654,8 @@ class RubaihBot:
         print(f"[RUBAIH] Hedge pair: {target}")
         print(f"[RUBAIH] AI augmentation: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
         print(f"[RUBAIH] LIVE_TRADING: {'ON — real orders' if self._live else 'OFF — dry-run only'}")
-        print(f"[RUBAIH] Capital target: {CFG['trading'].get('capital_usdt', '?')} USDT @ {self._leverage}x")
+        print(f"[RUBAIH] Capital target: ₹{CFG['trading'].get('capital_inr', '?')} INR-M @ {self._leverage}x")
+        print(f"[RUBAIH] Margin currency: {MARGIN_CCY}")
         await self.store.set_engine_status("running" if self._live else "dry_run")
 
     async def ws_listener(self):

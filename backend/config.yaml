@@ -1,5 +1,6 @@
 # Rubaih Configuration — CoinDCX Futures Delta-Hedge Bot
-# Sized for ~600 USDT live capital (conservative).
+# Sized for ~₹1000 INR-M capital (micro account).
+# Note: BTC mins are large vs ₹1k — keep leverage modest and sizes at exchange min.
 
 exchange:
   name: "coindcx"
@@ -7,10 +8,9 @@ exchange:
   public_url: "https://public.coindcx.com"
   ws_url: "https://stream.coindcx.com"
 
-  # Futures margin mode: USDT or INR
-  margin_currency: "USDT"
+  # INR-margined futures (prices still quoted in USDT)
+  margin_currency: "INR"
 
-  # Fee structure (fractions — CoinDCX futures typically ~0.025% / 0.075%)
   maker_fee: 0.00025
   taker_fee: 0.00075
 
@@ -18,32 +18,30 @@ trading:
   underlying: "BTC"
   perp_symbol: "B-BTC_USDT"
 
-  # Account sizing — ~600 USDT margin
-  capital_usdt: 600
-  leverage: 2                    # Keep low on small capital (liq risk)
+  # Account sizing — ₹1000 INR margin wallet
+  capital_inr: 1000
+  leverage: 5                    # Needed so min BTC size can fit; still careful
 
-  # Delta hedge parameters (BTC units @ ~$65k → 0.005 BTC ≈ $325 notional)
-  delta_threshold: 0.002         # Hedge when |delta| exceeds this
-  max_delta: 0.01                # Hard kill ~$650 notional (~1x capital)
-  max_vega: 500.0
-  max_drawdown_pct: 0.08         # Halt after ~8% session drawdown (~$48)
+  # Delta in BTC units — micro: 0.001 BTC ≈ one typical min lot
+  delta_threshold: 0.0005
+  max_delta: 0.002               # Kill if exposure > ~2 min lots
+  max_vega: 100.0
+  max_drawdown_pct: 0.15         # ~₹150 session DD halt (small book = noisy)
 
-  # Cost-aware rebalancing
-  min_hedge_interval_sec: 45
-  cost_buffer_multiplier: 1.5
+  min_hedge_interval_sec: 60
+  cost_buffer_multiplier: 1.2
 
-  # Order sizing — never put most of the book in one shot
-  # 0.004 BTC ≈ $260 notional → ~$130 margin at 2x
-  max_order_size_btc: 0.004
-  twap_slices: 2
-  twap_interval_sec: 8
+  # Stay at / near exchange minimum lot
+  max_order_size_btc: 0.001
+  twap_slices: 1
+  twap_interval_sec: 5
 
 risk:
   kill_switch_on_drawdown: true
   kill_switch_on_delta_limit: true
   kill_switch_on_vega_limit: true
   emergency_flatten: true
-  rate_limit_orders_per_sec: 5
+  rate_limit_orders_per_sec: 3
 
 api:
   host: "0.0.0.0"
