@@ -1,21 +1,41 @@
 /**
- * Rubaih mobile runtime config — PRODUCTION
+ * Defaults only. Prefer editing VPS IP + token inside the app Settings tab.
+ * Values save on the phone (AsyncStorage) — no rebuild needed after first install.
  *
- * Before building the APK:
- * 1. Set API_HOST to your VPS IP or domain (no trailing slash)
- * 2. Set API_TOKEN to the same RUBAIH_API_TOKEN as in server .env
- *
- * setup-vps.sh can patch API_HOST automatically.
- * Prefer nginx :80 (no :8000) so traffic goes through the reverse proxy.
+ * Phone must use nginx port 80:
+ *   http://YOUR_VPS_IP
+ * NOT http://YOUR_VPS_IP:8000  (API is localhost-only behind nginx)
  */
 
-export const API_HOST = 'http://YOUR_VPS_IP';
-export const API_TOKEN = 'YOUR_RUBAIH_API_TOKEN';
+export const DEFAULT_API_HOST = 'http://YOUR_VPS_IP';
+export const DEFAULT_API_TOKEN = 'YOUR_RUBAIH_API_TOKEN';
 
-export const API_URL = `${API_HOST}/api`;
-export const WS_URL = `${API_HOST.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(API_TOKEN)}`;
+export function normalizeHost(host) {
+  let h = (host || '').trim().replace(/\/+$/, '');
+  if (!h) return '';
+  if (!/^https?:\/\//i.test(h)) h = `http://${h}`;
+  // strip accidental :8000 — public traffic is nginx :80
+  h = h.replace(/:8000$/, '');
+  return h;
+}
 
-export const AUTH_HEADERS = {
-  'Content-Type': 'application/json',
-  'X-API-Token': API_TOKEN,
-};
+export function buildUrls(host, token) {
+  const apiHost = normalizeHost(host);
+  const apiToken = (token || '').trim();
+  return {
+    apiHost,
+    apiToken,
+    apiUrl: `${apiHost}/api`,
+    wsUrl: `${apiHost.replace(/^http/i, 'ws')}/ws?token=${encodeURIComponent(apiToken)}`,
+    authHeaders: {
+      'Content-Type': 'application/json',
+      'X-API-Token': apiToken,
+    },
+    configured: Boolean(
+      apiHost &&
+      !apiHost.includes('YOUR_VPS_IP') &&
+      apiToken &&
+      !apiToken.includes('YOUR_RUBAIH')
+    ),
+  };
+}
