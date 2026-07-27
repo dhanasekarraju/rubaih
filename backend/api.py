@@ -22,6 +22,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depe
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from openrouter_ai import ai_configured
+
 API_TOKEN = os.getenv("RUBAIH_API_TOKEN", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
 
@@ -196,7 +198,7 @@ async def dashboard():
             timestamp=_utc_now(),
             spot_price=0.0, delta=0.0, gamma=0.0, vega=0.0, theta=0.0,
             session_pnl=session_pnl, num_positions=0, status=engine_status,
-            ai_enabled=bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+            ai_enabled=ai_configured(),
             ai_last_action=None, ai_confidence=None,
             live_trading=LIVE_TRADING,
         )
@@ -211,7 +213,7 @@ async def dashboard():
         session_pnl=session_pnl,
         num_positions=int(count or 0),
         status=engine_status,
-        ai_enabled=bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+        ai_enabled=ai_configured(),
         ai_last_action=ai_row["action"] if ai_row else None,
         ai_confidence=float(ai_row["confidence"]) if ai_row else None,
         live_trading=LIVE_TRADING,

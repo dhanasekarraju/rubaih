@@ -31,7 +31,7 @@ import socketio
 import yaml
 from scipy.stats import norm
 
-from openrouter_ai import OpenRouterAI, AIDecision
+from openrouter_ai import OpenRouterAI, AIDecision, ai_configured
 
 # ==============================================================================
 # CONFIG
@@ -746,7 +746,7 @@ class RubaihBot:
         self.client: Optional[CoinDCXClient] = None
         self.products: Dict[str, CoinDCXProduct] = {}
         self._running = False
-        self._ai_enabled = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+        self._ai_enabled = ai_configured()
         self._hedge_history: List[Dict] = []
         self._leverage = int(CFG["trading"].get("leverage", 15))
         self._live = LIVE_TRADING
@@ -869,6 +869,9 @@ class RubaihBot:
         self.client = CoinDCXClient(self.auth)
         await self.client.__aenter__()
         await self.client.verify_credentials()
+        if self._live and not self.client._auth_ok:
+            print("[WARN] LIVE_TRADING=true but CoinDCX auth FAILED — live orders will be blocked")
+            print("[WARN] Set LIVE_TRADING=false until [AUTH] CoinDCX OK appears")
 
         instruments = await self.client.get_active_instruments()
         target = CFG["trading"]["perp_symbol"]
@@ -1198,7 +1201,14 @@ class RubaihBot:
             if qty < perp_prod.min_quantity:
                 print(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
                 return False
-            if not self._live:
+            live_ok = self._live and self.client and self.client._auth_ok
+            if self._live and self.client and not self.client._auth_ok:
+                print(
+                    f"[LIVE BLOCKED] Auth failed — not sending {side.value} {qty} {perp_symbol}. "
+                    "Fix CoinDCX keys or set LIVE_TRADING=false"
+                )
+                return False
+            if not live_ok:
                 print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
                 await self.store.save_hedge(signal, spot)
                 self._apply_dry_fill(perp_symbol, side, qty, spot)

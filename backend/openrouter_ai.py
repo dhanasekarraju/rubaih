@@ -1,17 +1,17 @@
 """
 ================================================================================
-RUBAIH AI — OpenRouter Integration for Trading Decisions
+RUBAIH AI — Gemini primary, OpenRouter fallback
 ================================================================================
-Uses OpenRouter free-tier models to optionally augment quantitative decisions.
-
-Free models churn often — prefer openrouter/free router, then stable :free slugs.
-On repeated failure we back off (bot keeps running on futures_cycle / quant).
+1) Google Gemini (GEMINI_API_KEY) — preferred
+2) OpenRouter free models (OPENROUTER_API_KEY) — fallback
+Quant / futures_cycle engine keeps running if both fail.
 ================================================================================
 """
 
 import os
 import json
 import time
+import re
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 
@@ -21,109 +21,83 @@ load_dotenv()
 
 import aiohttp
 
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GEMINI_KEY = (
+    os.getenv("GEMINI_API_KEY", "").strip()
+    or os.getenv("GOOGLE_API_KEY", "").strip()
+    or os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Prefer auto free router; then currently common free slugs (catalog changes often)
-MODEL_CHAIN = [
+OPENROUTER_MODELS = [
     "openrouter/free",
-    "meta-llama/llama-3.3-70b-instruct:free",
     "openai/gpt-oss-20b:free",
-    "google/gemma-4-31b-it:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
+    "google/gemma-3-27b-it:free",
 ]
+
 
 @dataclass
 class AIDecision:
-    action: str           # "HEDGE" | "HOLD" | "ADJUST_THRESHOLD" | "EMERGENCY"
-    confidence: float       # 0.0 - 1.0
+    action: str
+    confidence: float
     reasoning: str
     suggested_hedge_size: Optional[float]
     risk_assessment: str
     model_used: str
 
-class OpenRouterAI:
-    """
-    AI-augmented trading decision engine.
 
-    Called periodically (not every tick). Quantitative / futures_cycle engine
-    remains the authority when AI is unavailable.
-    """
+def ai_configured() -> bool:
+    return bool(GEMINI_KEY or OPENROUTER_KEY)
+
+
+def _extract_json(text: str) -> dict:
+    text = (text or "").strip()
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts[1::2]:
+            chunk = part.strip()
+            if chunk.startswith("json"):
+                chunk = chunk[4:].strip()
+            try:
+                return json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+
+class OpenRouterAI:
+    """Gemini first, then OpenRouter. Same analyze_market() interface as before."""
 
     def __init__(self):
-        self.api_key = OPENROUTER_KEY
+        self.gemini_key = GEMINI_KEY
+        self.openrouter_key = OPENROUTER_KEY
         self.session: Optional[aiohttp.ClientSession] = None
         self._call_history: List[Dict] = []
         self._last_call: float = 0.0
-        self._min_interval = 60.0  # seconds between AI attempts
+        self._min_interval = 60.0
         self._fail_streak = 0
         self._backoff_until = 0.0
-        self._dead_models: Dict[str, float] = {}  # model -> retry_after ts
+        self._dead_models: Dict[str, float] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
 
-    async def _call_model(self, model: str, messages: List[Dict], temperature: float = 0.2) -> Optional[Dict]:
-        """Call a single OpenRouter model."""
-        if not self.api_key:
-            return None
-        dead_until = self._dead_models.get(model, 0)
-        if time.time() < dead_until:
-            return None
-
-        session = await self._get_session()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://rubaih-bot.local",
-            "X-Title": "Rubaih CoinDCX Futures Bot"
-        }
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 800,
-        }
-        # json_object not supported by every free model
-        if model != "openrouter/free":
-            payload["response_format"] = {"type": "json_object"}
-
-        try:
-            async with session.post(
-                OPENROUTER_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                text = await resp.text()
-                if resp.status == 429:
-                    self._dead_models[model] = time.time() + 300
-                    if self._fail_streak < 2:
-                        print(f"[AI] Rate limited on {model} — cooling 5m")
-                    return None
-                if resp.status == 404:
-                    self._dead_models[model] = time.time() + 86400
-                    if self._fail_streak < 2:
-                        print(f"[AI] Model gone ({model}) — skip 24h")
-                    return None
-                if self._fail_streak < 3:
-                    print(f"[AI] Error {resp.status} from {model}: {text[:160]}")
-                return None
-        except Exception as e:
-            if self._fail_streak < 3:
-                print(f"[AI] Exception calling {model}: {e}")
-            return None
-
-    async def analyze_market(self, context: Dict) -> Optional[AIDecision]:
-        now = time.time()
-        if now < self._backoff_until:
-            return None
-        if now - self._last_call < self._min_interval:
-            return None
-        self._last_call = now
-
+    def _prompts(self, context: Dict):
         system_prompt = """You are Rubaih, a crypto INR-M futures cycle assistant on CoinDCX.
 You review portfolio state and may suggest HOLD / HEDGE / EMERGENCY.
 
@@ -154,48 +128,159 @@ Rules:
 - Recent hedges (last 5): {json.dumps(context.get('recent_hedges', [])[-5:])}
 
 What is your decision?"""
+        return system_prompt, user_prompt
 
+    async def _call_gemini(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        if not self.gemini_key:
+            return None
+        dead_until = self._dead_models.get("gemini", 0)
+        if time.time() < dead_until:
+            return None
+
+        session = await self._get_session()
+        url = f"{GEMINI_URL}?key={self.gemini_key}"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 800,
+                "responseMimeType": "application/json",
+            },
+        }
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    data = json.loads(text)
+                    parts = (
+                        data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [])
+                    )
+                    out = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                    return out or None
+                if resp.status == 429:
+                    self._dead_models["gemini"] = time.time() + 300
+                    print("[AI] Gemini rate limited — cooling 5m, trying OpenRouter")
+                    return None
+                if resp.status in (400, 403, 404):
+                    self._dead_models["gemini"] = time.time() + 600
+                    print(f"[AI] Gemini error {resp.status}: {text[:160]} — falling back to OpenRouter")
+                    return None
+                print(f"[AI] Gemini error {resp.status}: {text[:160]}")
+                return None
+        except Exception as e:
+            print(f"[AI] Gemini exception: {e}")
+            return None
+
+    async def _call_openrouter(self, model: str, messages: List[Dict]) -> Optional[str]:
+        if not self.openrouter_key:
+            return None
+        dead_until = self._dead_models.get(model, 0)
+        if time.time() < dead_until:
+            return None
+
+        session = await self._get_session()
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://rubaih-bot.local",
+            "X-Title": "Rubaih CoinDCX Futures Bot",
+        }
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 800,
+        }
+        if model != "openrouter/free":
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            async with session.post(
+                OPENROUTER_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    data = json.loads(text)
+                    return data["choices"][0]["message"]["content"]
+                if resp.status == 429:
+                    self._dead_models[model] = time.time() + 300
+                    if self._fail_streak < 2:
+                        print(f"[AI] OpenRouter rate limited on {model}")
+                    return None
+                if resp.status == 404:
+                    self._dead_models[model] = time.time() + 86400
+                    if self._fail_streak < 2:
+                        print(f"[AI] OpenRouter model gone ({model})")
+                    return None
+                if self._fail_streak < 3:
+                    print(f"[AI] OpenRouter {resp.status} from {model}: {text[:140]}")
+                return None
+        except Exception as e:
+            if self._fail_streak < 3:
+                print(f"[AI] OpenRouter exception ({model}): {e}")
+            return None
+
+    def _parse_decision(self, content: str, model_used: str) -> Optional[AIDecision]:
+        try:
+            parsed = _extract_json(content)
+            decision = AIDecision(
+                action=parsed.get("action", "HOLD"),
+                confidence=float(parsed.get("confidence", 0.0)),
+                reasoning=parsed.get("reasoning", ""),
+                suggested_hedge_size=parsed.get("suggested_hedge_size"),
+                risk_assessment=parsed.get("risk_assessment", "UNKNOWN"),
+                model_used=model_used,
+            )
+            self._call_history.append({
+                "timestamp": time.time(),
+                "model": model_used,
+                "decision": parsed,
+            })
+            self._fail_streak = 0
+            print(f"[AI] {model_used} → {decision.action} (conf={decision.confidence:.2f})")
+            return decision
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            if self._fail_streak < 3:
+                print(f"[AI] Parse error from {model_used}: {e}")
+            return None
+
+    async def analyze_market(self, context: Dict) -> Optional[AIDecision]:
+        if not ai_configured():
+            return None
+        now = time.time()
+        if now < self._backoff_until:
+            return None
+        if now - self._last_call < self._min_interval:
+            return None
+        self._last_call = now
+
+        system_prompt, user_prompt = self._prompts(context)
+
+        # 1) Gemini primary
+        gemini_text = await self._call_gemini(system_prompt, user_prompt)
+        if gemini_text:
+            decision = self._parse_decision(gemini_text, f"gemini/{GEMINI_MODEL}")
+            if decision:
+                return decision
+
+        # 2) OpenRouter fallback
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
-
-        for model in MODEL_CHAIN:
-            result = await self._call_model(model, messages)
-            if result and "choices" in result:
-                try:
-                    content = result["choices"][0]["message"]["content"]
-                    # strip markdown fences if free router wraps JSON
-                    if "```" in content:
-                        content = content.split("```")[1]
-                        if content.startswith("json"):
-                            content = content[4:]
-                    parsed = json.loads(content.strip())
-                    decision = AIDecision(
-                        action=parsed.get("action", "HOLD"),
-                        confidence=float(parsed.get("confidence", 0.0)),
-                        reasoning=parsed.get("reasoning", ""),
-                        suggested_hedge_size=parsed.get("suggested_hedge_size"),
-                        risk_assessment=parsed.get("risk_assessment", "UNKNOWN"),
-                        model_used=model
-                    )
-                    self._call_history.append({
-                        "timestamp": time.time(),
-                        "model": model,
-                        "decision": parsed
-                    })
-                    self._fail_streak = 0
-                    print(f"[AI] {model} → {decision.action} (conf={decision.confidence:.2f})")
+        for model in OPENROUTER_MODELS:
+            content = await self._call_openrouter(model, messages)
+            if content:
+                decision = self._parse_decision(content, model)
+                if decision:
                     return decision
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
-                    if self._fail_streak < 3:
-                        print(f"[AI] Parse error from {model}: {e}")
-                    continue
 
         self._fail_streak += 1
-        # Exponential backoff: 2m, 5m, 15m, cap 30m
         wait = min(1800, 120 * (2 ** min(self._fail_streak - 1, 4)))
         self._backoff_until = time.time() + wait
         if self._fail_streak <= 3 or self._fail_streak % 10 == 0:
-            print(f"[AI] All models failed (x{self._fail_streak}). Quant engine continues. Retry in {wait:.0f}s")
+            print(f"[AI] Gemini+OpenRouter failed (x{self._fail_streak}). Quant continues. Retry in {wait:.0f}s")
         return None
