@@ -2,15 +2,10 @@
 ================================================================================
 RUBAIH AI — OpenRouter Integration for Trading Decisions
 ================================================================================
-Uses OpenRouter's free-tier models to augment quantitative hedging decisions.
+Uses OpenRouter free-tier models to optionally augment quantitative decisions.
 
-Recommended free models (zero cost):
-  - nvidia/nemotron-3-ultra-550b-a55b:free  → Deep reasoning, strategy review
-  - nvidia/nemotron-3-super-120b-a12b:free  → Multi-step analysis
-  - meta-llama/llama-4-maverick:free        → General trading logic
-  - qwen/qwen3-coder:free                   → Structured JSON output
-
-Rate limits: 20 req/min, 1000 req/day (after $10 deposit on OpenRouter)
+Free models churn often — prefer openrouter/free router, then stable :free slugs.
+On repeated failure we back off (bot keeps running on futures_cycle / quant).
 ================================================================================
 """
 
@@ -29,12 +24,13 @@ import aiohttp
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Fallback model chain — tries each in order if one fails
+# Prefer auto free router; then currently common free slugs (catalog changes often)
 MODEL_CHAIN = [
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "meta-llama/llama-4-maverick:free",
-    "qwen/qwen3-coder:free",
+    "openrouter/free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-oss-20b:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
 ]
 
 @dataclass
@@ -50,8 +46,8 @@ class OpenRouterAI:
     """
     AI-augmented trading decision engine.
 
-    Called every 30-60 seconds (not every tick — rate limits).
-    Provides qualitative overlay on top of quantitative Greeks engine.
+    Called periodically (not every tick). Quantitative / futures_cycle engine
+    remains the authority when AI is unavailable.
     """
 
     def __init__(self):
@@ -59,7 +55,10 @@ class OpenRouterAI:
         self.session: Optional[aiohttp.ClientSession] = None
         self._call_history: List[Dict] = []
         self._last_call: float = 0.0
-        self._min_interval = 30.0  # seconds between AI calls
+        self._min_interval = 60.0  # seconds between AI attempts
+        self._fail_streak = 0
+        self._backoff_until = 0.0
+        self._dead_models: Dict[str, float] = {}  # model -> retry_after ts
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -70,13 +69,16 @@ class OpenRouterAI:
         """Call a single OpenRouter model."""
         if not self.api_key:
             return None
+        dead_until = self._dead_models.get(model, 0)
+        if time.time() < dead_until:
+            return None
 
         session = await self._get_session()
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://rubaih-bot.local",
-            "X-Title": "Rubaih CoinDCX Hedge Bot"
+            "X-Title": "Rubaih CoinDCX Futures Bot"
         }
 
         payload = {
@@ -84,48 +86,48 @@ class OpenRouterAI:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": 800,
-            "response_format": {"type": "json_object"}
         }
+        # json_object not supported by every free model
+        if model != "openrouter/free":
+            payload["response_format"] = {"type": "json_object"}
 
         try:
-            async with session.post(OPENROUTER_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(
+                OPENROUTER_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                elif resp.status == 429:
-                    print(f"[AI] Rate limited on {model}")
+                    return await resp.json()
+                text = await resp.text()
+                if resp.status == 429:
+                    self._dead_models[model] = time.time() + 300
+                    if self._fail_streak < 2:
+                        print(f"[AI] Rate limited on {model} — cooling 5m")
                     return None
-                else:
-                    text = await resp.text()
-                    print(f"[AI] Error {resp.status} from {model}: {text[:200]}")
+                if resp.status == 404:
+                    self._dead_models[model] = time.time() + 86400
+                    if self._fail_streak < 2:
+                        print(f"[AI] Model gone ({model}) — skip 24h")
                     return None
+                if self._fail_streak < 3:
+                    print(f"[AI] Error {resp.status} from {model}: {text[:160]}")
+                return None
         except Exception as e:
-            print(f"[AI] Exception calling {model}: {e}")
+            if self._fail_streak < 3:
+                print(f"[AI] Exception calling {model}: {e}")
             return None
 
     async def analyze_market(self, context: Dict) -> Optional[AIDecision]:
-        """
-        Main entry point. Sends market context to AI, gets structured decision.
-
-        context = {
-            "portfolio_greeks": {"delta": 0.12, "gamma": 0.0003, "vega": 1200, "theta": -45},
-            "spot_price": 95200.0,
-            "recent_hedges": [...],
-            "iv_change_1h": 0.02,
-            "funding_rate": 0.0001,
-            "time_since_last_hedge": 45.0,
-            "quant_signal": "HOLD"  # What the quantitative engine says
-        }
-        """
         now = time.time()
+        if now < self._backoff_until:
+            return None
         if now - self._last_call < self._min_interval:
             return None
         self._last_call = now
 
-        system_prompt = """You are Rubaih, an elite crypto futures delta-hedge strategist on CoinDCX.
-You analyze portfolio Greeks and market microstructure to make hedging decisions.
+        system_prompt = """You are Rubaih, a crypto INR-M futures cycle assistant on CoinDCX.
+You review portfolio state and may suggest HOLD / HEDGE / EMERGENCY.
 
-Respond ONLY in valid JSON with this exact structure:
+Respond ONLY in valid JSON:
 {
   "action": "HEDGE" | "HOLD" | "ADJUST_THRESHOLD" | "EMERGENCY",
   "confidence": 0.0 to 1.0,
@@ -135,19 +137,16 @@ Respond ONLY in valid JSON with this exact structure:
 }
 
 Rules:
-- HEDGE only when delta drift is meaningful AND market conditions support it
-- HOLD when transaction costs would exceed expected P&L benefit
-- ADJUST_THRESHOLD when vol regime is changing
-- EMERGENCY only for extreme tail risks (IV spike >50%, liquidation cascade)
-- Confidence >0.8 required for HEDGE, >0.95 for EMERGENCY
-- Consider funding rate, IV term structure, and recent hedge frequency"""
+- Prefer HOLD when flat or already managed by the quantitative cycle
+- EMERGENCY only for extreme risk
+- Confidence >0.8 for HEDGE, >0.95 for EMERGENCY"""
 
         user_prompt = f"""Current market state:
 - Portfolio delta: {context['portfolio_greeks']['delta']:.4f} BTC
 - Portfolio gamma: {context['portfolio_greeks']['gamma']:.6f}
-- Portfolio vega: {context['portfolio_greeks']['vega']:.2f} USD/vol
-- Portfolio theta: {context['portfolio_greeks']['theta']:.2f} USD/day
-- Spot price: ${context['spot_price']:,.2f}
+- Portfolio vega: {context['portfolio_greeks']['vega']:.2f}
+- Portfolio theta: {context['portfolio_greeks']['theta']:.2f}
+- Spot price: {context['spot_price']:,.2f} USDT
 - IV change (1h): {context.get('iv_change_1h', 0):+.2%}
 - Funding rate: {context.get('funding_rate', 0):+.4%}
 - Time since last hedge: {context.get('time_since_last_hedge', 0):.0f}s
@@ -161,13 +160,17 @@ What is your decision?"""
             {"role": "user", "content": user_prompt}
         ]
 
-        # Try models in chain until one succeeds
         for model in MODEL_CHAIN:
             result = await self._call_model(model, messages)
             if result and "choices" in result:
                 try:
                     content = result["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
+                    # strip markdown fences if free router wraps JSON
+                    if "```" in content:
+                        content = content.split("```")[1]
+                        if content.startswith("json"):
+                            content = content[4:]
+                    parsed = json.loads(content.strip())
                     decision = AIDecision(
                         action=parsed.get("action", "HOLD"),
                         confidence=float(parsed.get("confidence", 0.0)),
@@ -181,15 +184,18 @@ What is your decision?"""
                         "model": model,
                         "decision": parsed
                     })
+                    self._fail_streak = 0
                     print(f"[AI] {model} → {decision.action} (conf={decision.confidence:.2f})")
                     return decision
-                except Exception as e:
-                    print(f"[AI] Failed to parse response from {model}: {e}")
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as e:
+                    if self._fail_streak < 3:
+                        print(f"[AI] Parse error from {model}: {e}")
                     continue
 
-        print("[AI] All models failed. Falling back to quantitative engine.")
+        self._fail_streak += 1
+        # Exponential backoff: 2m, 5m, 15m, cap 30m
+        wait = min(1800, 120 * (2 ** min(self._fail_streak - 1, 4)))
+        self._backoff_until = time.time() + wait
+        if self._fail_streak <= 3 or self._fail_streak % 10 == 0:
+            print(f"[AI] All models failed (x{self._fail_streak}). Quant engine continues. Retry in {wait:.0f}s")
         return None
-
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
