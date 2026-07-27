@@ -1,5 +1,5 @@
 # Rubaih Configuration — CoinDCX Futures Delta-Hedge Bot
-# ⚠️  EDUCATIONAL / RESEARCH PURPOSES ONLY. Live trading only — no testnet.
+# Sized for ~600 USDT live capital (conservative).
 
 exchange:
   name: "coindcx"
@@ -17,29 +17,33 @@ exchange:
 trading:
   underlying: "BTC"
   perp_symbol: "B-BTC_USDT"
-  leverage: 5
 
-  # Delta hedge parameters
-  delta_threshold: 0.05        # BTC units — trigger hedge when |delta| > this
-  max_delta: 0.50              # Hard kill-switch limit
-  max_vega: 5000.0             # USD per vol point
-  max_drawdown_pct: 0.05       # 5% session drawdown → halt
+  # Account sizing — ~600 USDT margin
+  capital_usdt: 600
+  leverage: 2                    # Keep low on small capital (liq risk)
+
+  # Delta hedge parameters (BTC units @ ~$65k → 0.005 BTC ≈ $325 notional)
+  delta_threshold: 0.002         # Hedge when |delta| exceeds this
+  max_delta: 0.01                # Hard kill ~$650 notional (~1x capital)
+  max_vega: 500.0
+  max_drawdown_pct: 0.08         # Halt after ~8% session drawdown (~$48)
 
   # Cost-aware rebalancing
-  min_hedge_interval_sec: 30
-  cost_buffer_multiplier: 1.5  # Only hedge if benefit > 1.5x cost
+  min_hedge_interval_sec: 45
+  cost_buffer_multiplier: 1.5
 
-  # Order sizing — keep small for live capital tests
-  max_order_size_btc: 0.25
-  twap_slices: 3
-  twap_interval_sec: 5
+  # Order sizing — never put most of the book in one shot
+  # 0.004 BTC ≈ $260 notional → ~$130 margin at 2x
+  max_order_size_btc: 0.004
+  twap_slices: 2
+  twap_interval_sec: 8
 
 risk:
   kill_switch_on_drawdown: true
   kill_switch_on_delta_limit: true
   kill_switch_on_vega_limit: true
   emergency_flatten: true
-  rate_limit_orders_per_sec: 10
+  rate_limit_orders_per_sec: 5
 
 api:
   host: "0.0.0.0"
@@ -47,10 +51,10 @@ api:
   jwt_secret: "${JWT_SECRET}"
   jwt_expiry_hours: 24
   cors_origins:
-    - "*"   # Lock this down in production to your mobile app domain
+    - "*"
 
 logging:
   level: "INFO"
   file: "logs/rubaih.log"
-  max_bytes: 10485760   # 10MB
+  max_bytes: 10485760
   backup_count: 5

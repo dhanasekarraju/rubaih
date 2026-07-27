@@ -278,10 +278,12 @@ async def get_settings():
     settings = await rd_client.hgetall("rubaih:settings")
     if not settings:
         settings = {
-            "delta_threshold": "0.05",
-            "max_delta": "0.50",
-            "max_vega": "5000.0",
-            "max_drawdown_pct": "0.05",
+            "delta_threshold": "0.002",
+            "max_delta": "0.01",
+            "max_vega": "500.0",
+            "max_drawdown_pct": "0.08",
+            "capital_usdt": "600",
+            "leverage": "2",
             "live_trading": str(LIVE_TRADING).lower(),
             "exchange": "coindcx",
             "perp_symbol": "B-BTC_USDT",

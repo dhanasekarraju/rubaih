@@ -369,6 +369,8 @@ export default function App() {
         {activeTab === 'settings' && (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Bot Settings</Text>
+            <SettingsRow label="Capital" value={fmtSetting(settings?.capital_usdt, ' USDT')} />
+            <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
             <SettingsRow label="Exchange" value="CoinDCX" />
             <SettingsRow label="Hedge Pair" value={fmtSetting(settings?.perp_symbol || 'B-BTC_USDT')} />
             <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />

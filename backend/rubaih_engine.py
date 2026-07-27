@@ -534,6 +534,8 @@ class RubaihBot:
             "max_delta": str(cfg["max_delta"]),
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
+            "capital_usdt": str(cfg.get("capital_usdt", 0)),
+            "leverage": str(cfg.get("leverage", 2)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
             "perp_symbol": cfg["perp_symbol"],
@@ -651,6 +653,7 @@ class RubaihBot:
         print(f"[RUBAIH] Hedge pair: {target}")
         print(f"[RUBAIH] AI augmentation: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
         print(f"[RUBAIH] LIVE_TRADING: {'ON — real orders' if self._live else 'OFF — dry-run only'}")
+        print(f"[RUBAIH] Capital target: {CFG['trading'].get('capital_usdt', '?')} USDT @ {self._leverage}x")
         await self.store.set_engine_status("running" if self._live else "dry_run")
 
     async def ws_listener(self):
@@ -866,17 +869,17 @@ class RubaihBot:
             await self.store.save_hedge(signal, spot)
             return True
 
-        if size > cfg["max_order_size_btc"] and not force:
-            slices = cfg["twap_slices"]
+        if size > cfg["max_order_size_btc"]:
+            slices = max(1, int(math.ceil(size / cfg["max_order_size_btc"])))
+            slices = min(slices, cfg.get("twap_slices", 3) if not force else max(slices, 1))
             slice_size = self._round_qty(size / slices, perp_prod)
-            print(f"[HEDGE] TWAP: {slices} slices of {slice_size} on {perp_symbol}")
+            print(f"[HEDGE] TWAP: {slices} slices of {slice_size} on {perp_symbol}{' (force)' if force else ''}")
             for i in range(slices):
                 await _place(slice_size)
                 if i < slices - 1:
-                    await asyncio.sleep(cfg["twap_interval_sec"])
+                    await asyncio.sleep(cfg["twap_interval_sec"] if not force else max(2, cfg["twap_interval_sec"] // 2))
         else:
-            # Emergency / normal: single (or capped) market order
-            qty = self._round_qty(min(size, cfg["max_order_size_btc"]) if force else size, perp_prod)
+            qty = self._round_qty(size, perp_prod)
             await _place(qty)
 
     async def _emergency_unwind(self):
