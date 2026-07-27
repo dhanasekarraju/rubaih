@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
   SafeAreaView, RefreshControl, Animated, Dimensions, StatusBar,
-  Alert, AppState, TextInput, KeyboardAvoidingView, Platform,
+  Alert, AppState, TextInput, Modal, Pressable,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DEFAULT_API_HOST, DEFAULT_API_TOKEN, buildUrls, normalizeHost } from './config';
@@ -45,6 +45,9 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [activeTab, setActiveTab] = useState('settings');
   const [saving, setSaving] = useState(false);
+  const [editOpen, setEditOpen] = useState(true);
+  const hostRef = useRef(null);
+  const tokenRef = useRef(null);
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const wsRef = useRef(null);
@@ -73,14 +76,21 @@ export default function App() {
           setHostInput(next.apiHost || DEFAULT_API_HOST);
           setTokenInput(next.apiToken || DEFAULT_API_TOKEN);
           setConn(next);
-          if (!next.configured) setActiveTab('settings');
-          else setActiveTab('dashboard');
+          if (!next.configured) {
+            setActiveTab('settings');
+            setEditOpen(true);
+          } else {
+            setActiveTab('dashboard');
+            setEditOpen(false);
+          }
         } else {
           setActiveTab('settings');
+          setEditOpen(true);
         }
       } catch (e) {
         console.error(e);
         setActiveTab('settings');
+        setEditOpen(true);
       } finally {
         setReady(true);
       }
@@ -212,6 +222,7 @@ export default function App() {
       setHostInput(next.apiHost);
       setTokenInput(next.apiToken);
       setConn(next);
+      setEditOpen(false);
       Alert.alert('Saved', `Connecting via nginx:\n${next.apiHost}\n\nUse port 80 (no :8000).`);
       setActiveTab('dashboard');
     } catch (e) {
@@ -325,25 +336,25 @@ export default function App() {
         ))}
       </View>
 
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView
-          style={styles.scroll}
-          keyboardShouldPersistTaps="handled"
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.gold} />}
-        >
+      <ScrollView
+        style={styles.scroll}
+        keyboardShouldPersistTaps="always"
+        nestedScrollEnabled
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.gold} />}
+      >
           {activeTab === 'dashboard' && (
             <>
               {!conn.configured && (
-                <TouchableOpacity style={styles.warnCard} onPress={() => setActiveTab('settings')}>
+                <TouchableOpacity style={styles.warnCard} onPress={() => { setActiveTab('settings'); setEditOpen(true); }}>
                   <Text style={styles.warnTitle}>Connection not set</Text>
-                  <Text style={styles.warnBody}>Open Settings → enter VPS IP + API token → Save</Text>
+                  <Text style={styles.warnBody}>Tap here → enter VPS IP + API token → Save</Text>
                 </TouchableOpacity>
               )}
 
               <TouchableOpacity style={styles.killButton} onPress={triggerKillSwitch} activeOpacity={0.7}>
                 <View style={styles.killButtonInner}>
                   <Text style={styles.killButtonText}>EMERGENCY KILL SWITCH</Text>
-                  <Text style={styles.killButtonSub}>Confirm required · flattens & halts</Text>
+                  <Text style={styles.killButtonSub}>Confirm required · flattens and halts</Text>
                 </View>
               </TouchableOpacity>
 
@@ -455,41 +466,15 @@ export default function App() {
           {activeTab === 'settings' && (
             <>
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Connection (editable)</Text>
+                <Text style={styles.cardTitle}>Server connection</Text>
                 <Text style={styles.help}>
-                  Use your VPS public IP. Traffic goes through nginx on port 80.
-                  Example: 12.34.56.78  →  app uses http://12.34.56.78
+                  Tap Edit Connection to type your VPS IP and API token.
+                  Phone talks to nginx on port 80 (not :8000).
                 </Text>
-
-                <Text style={styles.inputLabel}>VPS IP or host</Text>
-                <TextInput
-                  style={styles.input}
-                  value={hostInput}
-                  onChangeText={setHostInput}
-                  placeholder="12.34.56.78"
-                  placeholderTextColor={COLORS.textMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  keyboardType="url"
-                />
-
-                <Text style={styles.inputLabel}>API token (RUBAIH_API_TOKEN from VPS .env)</Text>
-                <TextInput
-                  style={styles.input}
-                  value={tokenInput}
-                  onChangeText={setTokenInput}
-                  placeholder="paste token"
-                  placeholderTextColor={COLORS.textMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                />
-
-                <Text style={styles.preview}>
-                  Will call: {normalizeHost(hostInput) || '—'}/api
-                </Text>
-
-                <TouchableOpacity style={styles.saveBtn} onPress={saveConnection} disabled={saving}>
-                  <Text style={styles.saveBtnText}>{saving ? 'Saving…' : 'Save & Connect'}</Text>
+                <SettingsRow label="Current host" value={(conn.apiHost || '').replace(/^https?:\/\//, '') || 'not set'} />
+                <SettingsRow label="Token set" value={conn.configured ? 'yes' : 'no'} />
+                <TouchableOpacity style={styles.saveBtn} onPress={() => setEditOpen(true)}>
+                  <Text style={styles.saveBtnText}>Edit Connection</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.testBtn} onPress={testConnection}>
                   <Text style={styles.testBtnText}>Test /api/health</Text>
@@ -497,7 +482,7 @@ export default function App() {
               </View>
 
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Bot Settings (from server)</Text>
+                <Text style={styles.cardTitle}>Bot Settings (from server · read-only)</Text>
                 <SettingsRow label="Capital" value={fmtSetting(settings?.capital_inr, ' INR')} />
                 <SettingsRow label="Margin" value={fmtSetting(settings?.margin_currency || 'INR')} />
                 <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
@@ -506,12 +491,74 @@ export default function App() {
                 <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
                 <SettingsRow label="Delta Threshold" value={fmtSetting(settings?.delta_threshold, ' BTC')} />
                 <SettingsRow label="Max Delta" value={fmtSetting(settings?.max_delta, ' BTC')} />
-                <SettingsRow label="Active Host" value={(conn.apiHost || '').replace(/^https?:\/\//, '') || '—'} />
               </View>
             </>
           )}
         </ScrollView>
-      </KeyboardAvoidingView>
+
+      <Modal
+        visible={editOpen}
+        animationType="slide"
+        transparent={false}
+        onRequestClose={() => { if (conn.configured) setEditOpen(false); }}
+        onShow={() => { setTimeout(() => hostRef.current?.focus?.(), 300); }}
+      >
+        <SafeAreaView style={styles.modalRoot}>
+          <Text style={styles.modalTitle}>Edit Connection</Text>
+          <Text style={styles.help}>
+            Example IP: 12.34.56.78{"\n"}
+            Token: copy RUBAIH_API_TOKEN from VPS .env
+          </Text>
+
+          <Text style={styles.inputLabel}>VPS IP or host</Text>
+          <TextInput
+            ref={hostRef}
+            style={styles.input}
+            value={hostInput}
+            onChangeText={setHostInput}
+            placeholder="12.34.56.78"
+            placeholderTextColor={COLORS.textMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable
+            showSoftInputOnFocus
+            selectTextOnFocus
+            keyboardType="default"
+            returnKeyType="next"
+            onSubmitEditing={() => tokenRef.current?.focus?.()}
+            blurOnSubmit={false}
+          />
+
+          <Text style={styles.inputLabel}>API token</Text>
+          <TextInput
+            ref={tokenRef}
+            style={styles.input}
+            value={tokenInput}
+            onChangeText={setTokenInput}
+            placeholder="paste RUBAIH_API_TOKEN"
+            placeholderTextColor={COLORS.textMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable
+            showSoftInputOnFocus
+            selectTextOnFocus
+            keyboardType="default"
+            returnKeyType="done"
+          />
+
+          <Text style={styles.preview}>Will call: {normalizeHost(hostInput) || '—'}/api</Text>
+
+          <TouchableOpacity style={styles.saveBtn} onPress={saveConnection} disabled={saving}>
+            <Text style={styles.saveBtnText}>{saving ? 'Saving…' : 'Save & Connect'}</Text>
+          </TouchableOpacity>
+
+          {conn.configured ? (
+            <Pressable onPress={() => setEditOpen(false)} style={{ padding: 16, alignItems: 'center' }}>
+              <Text style={{ color: COLORS.textSecondary }}>Cancel</Text>
+            </Pressable>
+          ) : null}
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -617,9 +664,9 @@ const styles = StyleSheet.create({
   help: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 18, marginBottom: 14 },
   inputLabel: { color: COLORS.textMuted, fontSize: 11, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 },
   input: {
-    backgroundColor: COLORS.inputBg, borderWidth: 1, borderColor: COLORS.cardBorder,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, color: COLORS.text,
-    marginBottom: 12, fontSize: 14,
+    backgroundColor: COLORS.inputBg, borderWidth: 1, borderColor: COLORS.gold,
+    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 14, color: COLORS.text,
+    marginBottom: 12, fontSize: 16, minHeight: 52,
   },
   preview: { color: COLORS.cyan, fontSize: 11, marginBottom: 14 },
   saveBtn: {
@@ -630,6 +677,8 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: COLORS.cyan, borderRadius: 10, paddingVertical: 12, alignItems: 'center',
   },
   testBtnText: { color: COLORS.cyan, fontWeight: '600', fontSize: 13 },
+  modalRoot: { flex: 1, backgroundColor: COLORS.bg, padding: 20, paddingTop: 40 },
+  modalTitle: { fontSize: 22, fontWeight: 'bold', color: COLORS.gold, marginBottom: 12 },
   empty: { color: COLORS.textMuted, textAlign: 'center', padding: 20 },
   tradeRow: {
     flexDirection: 'row', alignItems: 'center',

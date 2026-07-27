@@ -1,7 +1,7 @@
-App icon assets (placeholders included for CI builds):
-- icon.png (1024x1024)
-- adaptive-icon.png (1024x1024)
-- splash.png
-- favicon.png
+App icon assets:
+- icon.png — launcher icon
+- adaptive-icon.png — Android adaptive foreground
+- splash.png — splash screen
+- favicon.png — web
 
-Replace these with real brand artwork before a store release.
+Replace anytime; rebuild APK after changing icons.
