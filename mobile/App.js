@@ -294,7 +294,7 @@ export default function App() {
     return typeof n === 'number' ? n.toFixed(digits) : n;
   };
 
-  // BTC futures marks are USDT-quoted; account capital / session PnL shown as INR.
+  // Futures marks are USDT-quoted; account capital / session PnL shown as INR.
   const formatInr = (n) => {
     if (n === undefined || n === null) return '—';
     return '₹' + Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -303,6 +303,10 @@ export default function App() {
     if (n === undefined || n === null) return '—';
     return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USDT';
   };
+
+  const activePair = dashboard?.active_pair || settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT';
+  const pairBase = String(activePair).replace(/^B-/, '').replace(/^I-/, '').split('_')[0] || 'BTC';
+  const pairUnit = ` ${pairBase}`;
 
   const fmtSetting = (v, suffix = '') => {
     if (v === undefined || v === null) return '—';
@@ -376,7 +380,7 @@ export default function App() {
 
               {dashboard && (
                 <View style={styles.heroCard}>
-                  <Text style={styles.heroLabel}>BTC Mark (USDT)</Text>
+                  <Text style={styles.heroLabel}>Mark (USDT) · {activePair}</Text>
                   <Text style={styles.heroPrice}>{formatUsdt(dashboard.spot_price)}</Text>
                   <Text style={styles.pnlLine}>Session PnL: {formatInr(dashboard.session_pnl)}</Text>
                   <View style={styles.heroRow}>
@@ -405,15 +409,53 @@ export default function App() {
               {dashboard && (
                 <View style={styles.greeksGrid}>
                   <GreekCard
-                    label="Delta"
+                    label="Position"
                     value={formatNumber(dashboard.delta, 4)}
-                    unit=" BTC"
-                    color={Math.abs(dashboard.delta) > 0.1 ? COLORS.red : COLORS.green}
+                    unit={pairUnit}
+                    color={Math.abs(dashboard.delta) > 0.0001 ? COLORS.gold : COLORS.green}
                     icon="Δ"
                   />
-                  <GreekCard label="Gamma" value={formatNumber(dashboard.gamma, 6)} color={COLORS.purple} icon="Γ" />
-                  <GreekCard label="Vega" value={formatNumber(dashboard.vega, 2)} unit=" /vol" color={COLORS.cyan} icon="V" />
-                  <GreekCard label="Theta" value={formatNumber(dashboard.theta, 2)} unit=" /day" color={COLORS.orange} icon="Θ" />
+                  <GreekCard
+                    label="Side"
+                    value={
+                      Math.abs(dashboard.delta || 0) < 0.00005
+                        ? 'FLAT'
+                        : dashboard.delta > 0
+                          ? 'LONG'
+                          : 'SHORT'
+                    }
+                    color={
+                      Math.abs(dashboard.delta || 0) < 0.00005
+                        ? COLORS.green
+                        : dashboard.delta > 0
+                          ? COLORS.cyan
+                          : COLORS.red
+                    }
+                    icon="◎"
+                  />
+                  <GreekCard
+                    label="Pair"
+                    value={pairBase}
+                    color={COLORS.gold}
+                    icon="◎"
+                  />
+                  <GreekCard
+                    label="Trades 24h"
+                    value={String(dashboard.num_positions ?? 0)}
+                    color={COLORS.purple}
+                    icon="#"
+                  />
+                </View>
+              )}
+
+              {dashboard && Math.abs(dashboard.delta || 0) < 0.00005 && (
+                <View style={styles.infoCard}>
+                  <Text style={styles.infoTitle}>Why Position is 0</Text>
+                  <Text style={styles.infoBody}>
+                    You are flat (no open futures on {activePair}). Delta = position size.{"\n"}
+                    Scanner picks the best momentum pair when flat.{"\n"}
+                    After a buy, Position shows the long size for that pair.
+                  </Text>
                 </View>
               )}
 
@@ -448,7 +490,7 @@ export default function App() {
                       {h.side.toUpperCase()}
                     </Text>
                   </View>
-                  <Text style={styles.tradeSize}>{Number(h.size).toFixed(4)} BTC</Text>
+                  <Text style={styles.tradeSize}>{Number(h.size).toFixed(4)} {(h.symbol || '').replace(/^B-/, '').split('_')[0] || pairBase}</Text>
                   <Text style={styles.tradePrice}>{formatUsdt(h.price)}</Text>
                   {h.ai_augmented ? <Text style={styles.aiBadge}>AI</Text> : null}
                 </View>
@@ -505,10 +547,11 @@ export default function App() {
                 <SettingsRow label="Margin" value={fmtSetting(settings?.margin_currency || 'INR')} />
                 <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
                 <SettingsRow label="Exchange" value="CoinDCX" />
-                <SettingsRow label="Pair" value={fmtSetting(settings?.perp_symbol || 'B-BTC_USDT')} />
+                <SettingsRow label="Pair" value={fmtSetting(settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT')} />
+                <SettingsRow label="Scan pairs" value={fmtSetting(settings?.scan_pairs || '—')} />
                 <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
-                <SettingsRow label="Delta Threshold" value={fmtSetting(settings?.delta_threshold, ' BTC')} />
-                <SettingsRow label="Max Delta" value={fmtSetting(settings?.max_delta, ' BTC')} />
+                <SettingsRow label="Delta Threshold" value={fmtSetting(settings?.delta_threshold, pairUnit)} />
+                <SettingsRow label="Max Delta" value={fmtSetting(settings?.max_delta, pairUnit)} />
               </View>
             </>
           )}
@@ -640,6 +683,16 @@ const styles = StyleSheet.create({
   },
   warnTitle: { color: COLORS.orange, fontWeight: '700', marginBottom: 4 },
   warnBody: { color: COLORS.textSecondary, fontSize: 12 },
+  infoCard: {
+    backgroundColor: COLORS.cyanDim,
+    borderColor: COLORS.cyan,
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 16,
+  },
+  infoTitle: { color: COLORS.cyan, fontWeight: '700', marginBottom: 6, fontSize: 13 },
+  infoBody: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 18 },
   killButton: { backgroundColor: COLORS.red, borderRadius: 16, marginBottom: 16 },
   killButtonInner: { padding: 18, alignItems: 'center' },
   killButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },

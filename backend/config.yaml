@@ -1,6 +1,6 @@
 # Rubaih Configuration — CoinDCX INR-M Futures Cycle Bot
-# Sized for ~₹1000 free futures margin (micro account).
-# Ignores other pairs (e.g. locked SLX). Live only when LIVE_TRADING=true.
+# Multi-pair scanner sized for ~₹5000 free futures margin.
+# Ignores locked books (e.g. SLX). Live only when LIVE_TRADING=true.
 
 exchange:
   name: "coindcx"
@@ -16,39 +16,45 @@ exchange:
 
 trading:
   underlying: "BTC"
-  perp_symbol: "B-BTC_USDT"
+  perp_symbol: "B-BTC_USDT"   # default / fallback when flat
 
-  # flat → buy → sell cycle (not options / not pure delta-hedge)
+  # flat → scan → buy → sell cycle
   mode: futures_cycle
 
-  # Account sizing — ₹1000 INR margin wallet
-  # 0.001 BTC @ ~100k USDT ≈ ₹8700 notional → margin ≈ ₹8700/leverage
-  capital_inr: 1000
-  leverage: 15                   # ~₹580 margin for 0.001 BTC (fits in ₹1k)
-  usdt_inr: 87                   # Sizing FX only
-  margin_buffer: 0.85            # Leave headroom for fees/funding
+  # Account sizing — ₹5000 INR margin wallet
+  capital_inr: 5000
+  leverage: 10
+  usdt_inr: 87
+  margin_buffer: 0.85
 
-  # Delta limits (also cap absolute position size in cycle mode)
+  # Multi-pair scanner
+  scan_enabled: true
+  scan_pairs:
+    - B-BTC_USDT
+    - B-ETH_USDT
+    - B-SOL_USDT
+  scan_max_pairs: 20
+  scan_interval_sec: 5
+
   delta_threshold: 0.0005
-  max_delta: 0.002               # Kill if exposure > ~2 min lots
+  max_delta: 0.05
   max_vega: 100.0
-  max_drawdown_pct: 0.15         # Halt on ~15% HWM drawdown
+  max_drawdown_pct: 0.15
 
   min_hedge_interval_sec: 60
   cost_buffer_multiplier: 1.2
 
-  # Stay at / near exchange minimum lot
-  max_order_size_btc: 0.001
+  max_order_size_btc: 0.01
   twap_slices: 1
   twap_interval_sec: 5
 
   strategy:
     entry_cooldown_sec: 120
-    momentum_lookback: 30        # price samples (~2s poll → ~1 min)
-    entry_move_pct: 0.0015       # 0.15% up to enter long
-    take_profit_pct: 0.004       # 0.4%
-    stop_loss_pct: 0.003         # 0.3%
-    max_hold_sec: 1800           # 30 min
+    momentum_lookback: 30
+    entry_move_pct: 0.0015
+    take_profit_pct: 0.004
+    stop_loss_pct: 0.003
+    max_hold_sec: 1800
     allow_short: false
     position_size_btc: 0.001
 

@@ -120,6 +120,7 @@ class DashboardData(BaseModel):
     ai_confidence: Optional[float]
     live_trading: bool
     exchange: str = "coindcx"
+    active_pair: str = "B-BTC_USDT"
 
 
 class HedgeTrade(BaseModel):
@@ -192,6 +193,13 @@ async def dashboard():
     )
     session_pnl = float(await rd_client.get("rubaih:session_pnl") or 0)
     engine_status = await rd_client.get("rubaih:engine_status") or ("no_data" if not row else "running")
+    settings = await rd_client.hgetall("rubaih:settings") or {}
+    active_pair = (
+        await rd_client.get("rubaih:active_pair")
+        or settings.get("active_pair")
+        or settings.get("perp_symbol")
+        or "B-BTC_USDT"
+    )
 
     if not row:
         return DashboardData(
@@ -201,6 +209,7 @@ async def dashboard():
             ai_enabled=ai_configured(),
             ai_last_action=None, ai_confidence=None,
             live_trading=LIVE_TRADING,
+            active_pair=active_pair,
         )
 
     return DashboardData(
@@ -217,6 +226,7 @@ async def dashboard():
         ai_last_action=ai_row["action"] if ai_row else None,
         ai_confidence=float(ai_row["confidence"]) if ai_row else None,
         live_trading=LIVE_TRADING,
+        active_pair=active_pair,
     )
 
 
@@ -290,12 +300,15 @@ async def get_settings():
             "max_delta": "0.002",
             "max_vega": "100.0",
             "max_drawdown_pct": "0.15",
-            "capital_inr": "1000",
-            "leverage": "15",
+            "capital_inr": "5000",
+            "leverage": "10",
             "live_trading": str(LIVE_TRADING).lower(),
             "exchange": "coindcx",
             "margin_currency": "INR",
             "perp_symbol": "B-BTC_USDT",
+            "active_pair": "B-BTC_USDT",
+            "scan_enabled": "true",
+            "scan_pairs": "B-BTC_USDT,B-ETH_USDT,B-SOL_USDT",
         }
     # Keep non-float metadata as strings in response
     out = {}
