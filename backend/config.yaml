@@ -49,9 +49,9 @@ trading:
     entry_cooldown_sec: 75
     momentum_lookback: 24
     entry_move_pct: 0.001
-    # Locked prices at buy (1R = stop distance)
-    take_profit_pct: 0.006      # ~2R if SL is 0.3%
-    stop_loss_pct: 0.003
+    # Locked at buy. RT taker fees ≈0.15% — TP must clear fees+slippage with room.
+    take_profit_pct: 0.012     # +1.2% (~2.4R) — net after fees ~1.0%
+    stop_loss_pct: 0.005       # −0.5% = 1R
     max_hold_sec: 1200
     allow_short: false
     # Risk vs THIS trade's margin (dynamic with capital)

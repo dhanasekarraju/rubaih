@@ -308,6 +308,13 @@ export default function App() {
     return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
   const fmtNum = (n, d = 4) => (n == null ? '—' : Number(n).toFixed(d));
+  // Engine stores fractions (0.012 = 1.2%). If server ever sends 1.2 meaning percent, don't *100 again.
+  const fmtPricePct = (raw, fallbackPct = 1.2) => {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n === 0) return `${Number(fallbackPct).toFixed(2)}%`;
+    const pct = n <= 1 ? n * 100 : n; // 0.012 → 1.2; 1.2 → 1.2
+    return `${pct.toFixed(2)}%`;
+  };
 
   const activePair = dashboard?.active_pair || settings?.active_pair || 'B-BTC_USDT';
   const pairBase = String(activePair).replace(/^B-/i, '').replace(/^I-/i, '').split('_')[0] || 'BTC';
@@ -403,11 +410,11 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>How exits work</Text>
               <Text style={styles.help}>
-                {`Size: ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free futures capital (live balance, not a fixed ₹).`}
+                {`TP +${fmtPricePct(settings?.take_profit_pct, 1.2)} and SL −${fmtPricePct(settings?.stop_loss_pct, 0.5)} are locked on the buy (price %, not margin %).`}
                 {"\n"}
-                {`At buy: locks TP (+${(((settings?.take_profit_pct ?? 0.006) * 100).toFixed(2))}%) and SL (−${(((settings?.stop_loss_pct ?? 0.003) * 100).toFixed(2))}%).`}
+                {`Also sent to CoinDCX as exchange take_profit / stop_loss on the entry order.`}
                 {"\n"}
-                {`Trail arms after +${settings?.trail_arm_r ?? 1}R, sells on ~${settings?.trail_giveback_r ?? 0.5}R giveback. Hard cut at ${Math.round((settings?.max_loss_frac ?? 0.10) * 100)}% of that trade's margin.`}
+                {`Trail: after +1R profit, sell on ~0.5R giveback. Size uses ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free capital (that is NOT the TP).`}
               </Text>
             </View>
           </>
@@ -491,7 +498,9 @@ export default function App() {
               <Text style={styles.cardTitle}>Bot (from server)</Text>
               <Row C={C} label="Free capital" value={`${settings?.free_capital_inr ?? settings?.capital_inr ?? '—'} INR`} />
               <Row C={C} label="Trade budget" value={`${settings?.trade_budget_inr ?? '—'} INR`} />
-              <Row C={C} label="Margin use" value={`${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}%`} />
+              <Row C={C} label="Take profit" value={settings?.tp_display || `+${fmtPricePct(settings?.take_profit_pct, 1.2)}`} />
+              <Row C={C} label="Stop loss" value={settings?.sl_display || `−${fmtPricePct(settings?.stop_loss_pct, 0.5)}`} />
+              <Row C={C} label="Size / free" value={`${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}%`} />
               <Row C={C} label="Leverage" value={`${settings?.leverage ?? '—'}x`} />
               <Row C={C} label="Active pair" value={settings?.active_pair || '—'} />
               <Row C={C} label="Live trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
