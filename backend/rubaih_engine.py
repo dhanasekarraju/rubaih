@@ -78,6 +78,7 @@ class CoinDCXProduct:
     contract_value: float = 1.0
     quantity_increment: float = 0.001
     min_quantity: float = 0.001
+    max_leverage: float = 10.0
 
 @dataclass
 class GreeksSnapshot:
@@ -589,26 +590,66 @@ class FuturesCycleStrategist:
             key = pair or CFG["trading"]["perp_symbol"]
             self._buf(key).append(float(mid))
 
-    def affordable_qty(self, spot: float, min_qty: float) -> float:
-        if spot <= 0 or self.usdt_inr <= 0 or self.leverage <= 0:
+    def affordable_qty(
+        self,
+        spot: float,
+        min_qty: float,
+        leverage: Optional[float] = None,
+        step: Optional[float] = None,
+    ) -> float:
+        """Size off free capital. Prefer 50–60%; allow min-lot using up to 100% free."""
+        if spot <= 0 or self.usdt_inr <= 0:
+            return 0.0
+        lev = float(leverage if leverage is not None else self.leverage)
+        if lev <= 0:
+            return 0.0
+        free = max(self.free_capital_inr, self.capital_inr, 0.0)
+        if free <= 0:
             return 0.0
         budget = self.trade_margin_budget()
-        if budget <= 0:
-            return 0.0
-        qty = (budget * self.leverage) / (spot * self.usdt_inr)
-        free = max(self.free_capital_inr, self.capital_inr, 1.0)
-        if qty + 1e-12 < min_qty:
-            min_margin = (min_qty * spot * self.usdt_inr) / self.leverage
-            if min_margin <= free * self.margin_use_max_frac * 1.02:
-                return float(min_qty)
-            return 0.0
-        max_margin = free * self.margin_use_max_frac
-        margin = (qty * spot * self.usdt_inr) / self.leverage
-        if margin > max_margin * 1.01:
-            qty = (max_margin * self.leverage) / (spot * self.usdt_inr)
-            if qty + 1e-12 < min_qty:
+        qty = (budget * lev) / (spot * self.usdt_inr) if budget > 0 else 0.0
+        min_q = max(float(min_qty or 0.0), 0.0)
+        min_margin = (min_q * spot * self.usdt_inr) / lev if min_q > 0 else 0.0
+
+        # Below exchange min lot: still buy if the whole free balance can cover it
+        if min_q > 0 and qty + 1e-12 < min_q:
+            if min_margin <= free * 1.001:
+                qty = min_q
+            else:
                 return 0.0
-        return qty
+        else:
+            # Cap preferred size at max frac; never exceed free
+            max_margin = min(free, free * self.margin_use_max_frac)
+            margin = (qty * spot * self.usdt_inr) / lev
+            if margin > max_margin * 1.01:
+                qty = (max_margin * lev) / (spot * self.usdt_inr)
+            if min_q > 0 and qty + 1e-12 < min_q:
+                if min_margin <= free * 1.001:
+                    qty = min_q
+                else:
+                    return 0.0
+
+        # Floor to lot step without collapsing a valid min lot
+        st = float(step or 0.0)
+        if st > 0 and qty > 0:
+            floored = math.floor(qty / st + 1e-12) * st
+            decimals = max(0, min(8, int(round(-math.log10(st))) if st < 1 else 0))
+            floored = round(floored, decimals)
+            if floored + 1e-12 < min_q:
+                # bump to exact min if still affordable
+                if min_margin <= free * 1.001:
+                    qty = min_q
+                else:
+                    return 0.0
+            else:
+                qty = floored
+        return float(qty)
+
+    def margin_for(self, spot: float, qty: float, leverage: Optional[float] = None) -> float:
+        lev = float(leverage if leverage is not None else self.leverage)
+        if spot <= 0 or qty <= 0 or lev <= 0:
+            return 0.0
+        return (qty * spot * self.usdt_inr) / lev
 
     def _move_pct(self, pair: str, spot: float) -> Optional[float]:
         hist = list(self._buf(pair))
@@ -691,13 +732,22 @@ class FuturesCycleStrategist:
         self._plan_size = float(data.get("size") or 0)
         self._entry_ts = float(data.get("entry_ts") or 0)
 
-    def pick_entry(self, pair_mids: Dict[str, float], min_qty_by_pair: Dict[str, float]) -> Optional[HedgeSignal]:
+    def pick_entry(
+        self,
+        pair_mids: Dict[str, float],
+        min_qty_by_pair: Dict[str, float],
+        leverage_by_pair: Optional[Dict[str, float]] = None,
+        step_by_pair: Optional[Dict[str, float]] = None,
+    ) -> Optional[HedgeSignal]:
         now = time.time()
         if now - self._last_signal < max(self.min_interval, self.entry_cooldown):
             return None
         ranked = []
         skipped_size = skipped_move = warming = 0
         budget = self.trade_margin_budget()
+        free = max(self.free_capital_inr, self.capital_inr, 0.0)
+        lev_map = leverage_by_pair or {}
+        step_map = step_by_pair or {}
         for pair, spot in pair_mids.items():
             if spot <= 0:
                 continue
@@ -709,21 +759,28 @@ class FuturesCycleStrategist:
                 skipped_move += 1
                 continue
             min_q = float(min_qty_by_pair.get(pair, 0.001) or 0.001)
-            qty = self.affordable_qty(spot, min_q)
+            lev = float(lev_map.get(pair, self.leverage) or self.leverage)
+            step = float(step_map.get(pair, 0.0) or 0.0)
+            qty = self.affordable_qty(spot, min_q, leverage=lev, step=step or None)
             if qty <= 0:
                 skipped_size += 1
                 continue
-            score = move * 0.85 if pair == self._last_entry_pair else move
-            margin_inr = (qty * spot * self.usdt_inr) / max(self.leverage, 1)
-            ranked.append((score, move, pair, spot, qty, margin_inr))
+            margin_inr = self.margin_for(spot, qty, lev)
+            # Prefer strong move; slight bias to pairs that fit cleanly in budget (small capital)
+            fit = 1.0 if margin_inr <= budget * 1.05 else 0.92
+            score = move * fit
+            if pair == self._last_entry_pair:
+                score *= 0.85
+            ranked.append((score, move, pair, spot, qty, margin_inr, lev))
 
         if now - self._last_scan_log > 30:
             self._last_scan_log = now
             top = ", ".join(
-                f"{p}:{m:.2%}~₹{mar:.0f}" for _s, m, p, _sp, _q, mar in sorted(ranked, reverse=True)[:5]
+                f"{p}:{m:.2%}~₹{mar:.0f}@{int(lv)}x"
+                for _s, m, p, _sp, _q, mar, lv in sorted(ranked, reverse=True)[:5]
             ) or "none"
             self._last_scan_msg = (
-                f"[SCAN] free=₹{self.free_capital_inr:.0f} budget=₹{budget:.0f} "
+                f"[SCAN] free=₹{free:.0f} budget=₹{budget:.0f} "
                 f"({self.margin_use_frac:.0%}–{self.margin_use_max_frac:.0%}) "
                 f"cand={len(pair_mids)} qual={len(ranked)} warm={warming} "
                 f"flat={skipped_move} skip_size={skipped_size} top=[{top}]"
@@ -733,18 +790,27 @@ class FuturesCycleStrategist:
         if not ranked:
             return None
         ranked.sort(reverse=True)
-        _score, move, pair, spot, qty, margin_inr = ranked[0]
+        _score, move, pair, spot, qty, margin_inr, lev = ranked[0]
         notional_inr = qty * spot * self.usdt_inr
         fee_inr = notional_inr * self.taker_fee * 2
         tp_inr = notional_inr * self.take_profit_pct
-        if tp_inr < fee_inr * 1.25:
-            print(f"[SCAN] skip {pair}: TP ₹{tp_inr:.0f} thin vs fees ₹{fee_inr:.0f}")
-            return None
+        if tp_inr < fee_inr * 1.15:
+            # Try next affordable candidate instead of burning the whole scan
+            for cand in ranked[1:]:
+                _s, move, pair, spot, qty, margin_inr, lev = cand
+                notional_inr = qty * spot * self.usdt_inr
+                fee_inr = notional_inr * self.taker_fee * 2
+                tp_inr = notional_inr * self.take_profit_pct
+                if tp_inr >= fee_inr * 1.15:
+                    break
+            else:
+                print(f"[SCAN] skip all: TP thin vs fees at free=₹{free:.0f}")
+                return None
         self._last_signal = now
         return HedgeSignal(
             now, qty, 0.0, qty, "passive",
             f"ENTRY_LONG: {pair} move={move:.2%} size={qty:.6f} "
-            f"margin~₹{margin_inr:.0f}/{self.free_capital_inr:.0f} free",
+            f"margin~₹{margin_inr:.0f}/{free:.0f} free @{int(lev)}x",
             False, pair=pair,
         )
 
@@ -757,7 +823,6 @@ class FuturesCycleStrategist:
         size = position.size
         if side != "buy" or entry <= 0:
             if side == "sell":
-                self.clear_trade()
                 self._last_signal = now
                 return HedgeSignal(
                     now, 0.0, -size, size, "immediate",
@@ -778,10 +843,9 @@ class FuturesCycleStrategist:
         pnl = self.pnl_inr(entry, spot, size)
         if position.unrealized_pnl:
             exch = float(position.unrealized_pnl)
-            if abs(exch) > abs(pnl) * 3 and abs(exch) > 20:
+            # unrealized_pnl is INR (sync/publish normalize) — use exchange mark when present
+            if abs(exch) >= 1:
                 pnl = exch
-            elif abs(exch) * self.usdt_inr > abs(pnl) * 0.5:
-                pnl = exch * self.usdt_inr
 
         self._peak_pnl_inr = max(self._peak_pnl_inr, pnl)
         self._peak_price = max(self._peak_price, spot)
@@ -807,8 +871,8 @@ class FuturesCycleStrategist:
             )
 
         def _exit(reason: str) -> HedgeSignal:
+            # Keep plan until fill confirms — failed exits must not wipe TP/SL/trail peak
             self._last_signal = now
-            self.clear_trade()
             return HedgeSignal(now, 0.0, size, -size, "immediate", reason, False, pair=pair)
 
         if spot >= self._tp_price:
@@ -1061,6 +1125,22 @@ class RubaihBot:
         self._active_pair = CFG["trading"]["perp_symbol"]
         self._pair_mids: Dict[str, float] = {}
         self._ws_pair = self._active_pair
+        self._last_fill_ts = 0.0
+        self._last_flatten_ts = 0.0
+
+    def _leverage_for(self, pair: Optional[str] = None) -> int:
+        """Config leverage capped by instrument max (e.g. SOL often 5x)."""
+        cfg_lev = max(1, int(self._leverage or 1))
+        prod = self.products.get(pair or "") if pair else None
+        if prod and getattr(prod, "max_leverage", 0):
+            return max(1, min(cfg_lev, int(float(prod.max_leverage))))
+        return cfg_lev
+
+    def _pnl_inr(self, entry: float, spot: float, size: float, side: str = "buy") -> float:
+        if entry <= 0 or spot <= 0 or size <= 0:
+            return 0.0
+        direction = 1.0 if (side or "buy").lower() in ("buy", "long") else -1.0
+        return (spot - entry) * size * direction * float(self.cycle.usdt_inr)
 
     async def _log(self, line: str):
         print(line)
@@ -1444,6 +1524,12 @@ class RubaihBot:
                 underlying = str(raw_u).upper().strip()
                 if underlying in ("INR", "USDT", "USD", "USD-M", "INR-M", ""):
                     underlying = base
+                max_lev = float(
+                    inst.get("max_leverage_long")
+                    or inst.get("max_leverage")
+                    or CFG["trading"].get("leverage", 10)
+                    or 10
+                )
                 prod = CoinDCXProduct(
                     pair=pair,
                     symbol=pair,
@@ -1452,6 +1538,7 @@ class RubaihBot:
                     contract_value=float(inst.get("unit_contract_value", 1.0) or 1.0),
                     quantity_increment=float(inst.get("quantity_increment", 0.001) or 0.001),
                     min_quantity=float(inst.get("min_quantity", 0.001) or 0.001),
+                    max_leverage=max(1.0, max_lev),
                 )
                 self.products[pair] = prod
                 self.portfolio.update_product(prod)
@@ -1684,9 +1771,8 @@ class RubaihBot:
             spot = next(iter(self._pair_mids.values()), 0.0)
         session_pnl = sum(p.unrealized_pnl for p in self.portfolio.positions.values())
         if self._dry_pos and spot > 0 and self._dry_pos.entry_price > 0:
-            direction = 1.0 if (self._dry_pos.side or "buy").lower() == "buy" else -1.0
-            self._dry_pos.unrealized_pnl = (
-                (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
+            self._dry_pos.unrealized_pnl = self._pnl_inr(
+                self._dry_pos.entry_price, spot, self._dry_pos.size, self._dry_pos.side or "buy",
             )
             session_pnl = self._dry_pos.unrealized_pnl
         await self.store.save_greeks(
@@ -1708,21 +1794,24 @@ class RubaihBot:
                 if self._mode == "futures_cycle" and self._dry_pos and self._dry_pos.size > 0:
                     spot = self._mid_for(self._dry_pos.symbol)
                     if spot > 0 and self._dry_pos.entry_price > 0:
-                        direction = 1.0 if self._dry_pos.side == "buy" else -1.0
-                        self._dry_pos.unrealized_pnl = (
-                            (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
+                        self._dry_pos.unrealized_pnl = self._pnl_inr(
+                            self._dry_pos.entry_price, spot, self._dry_pos.size, self._dry_pos.side or "buy",
                         )
                     self.portfolio.update_positions([self._dry_pos])
                     await self._set_active_pair(self._dry_pos.symbol)
-                    # Live: optionally overlay exchange marks, but never wipe local while open
+                    # Live: overlay exchange; clear ghost if exchange is flat
                     if self._live and self.client and self.client._auth_ok:
                         try:
                             raw = await self.client.get_positions() or []
+                            open_pairs = set()
+                            matched_flat = False
                             for rp in raw:
                                 pair = rp.get("pair", "")
+                                active = float(rp.get("active_pos", 0) or 0)
+                                if abs(active) > 0 and pair:
+                                    open_pairs.add(pair)
                                 if pair != self._dry_pos.symbol:
                                     continue
-                                active = float(rp.get("active_pos", 0) or 0)
                                 mark = float(rp.get("mark_price", 0) or 0)
                                 avg = float(rp.get("avg_price", 0) or 0)
                                 if abs(active) > 0:
@@ -1731,9 +1820,25 @@ class RubaihBot:
                                     if avg > 0:
                                         self._dry_pos.entry_price = avg
                                     if mark > 0 and avg > 0:
-                                        self._dry_pos.unrealized_pnl = (mark - avg) * active
+                                        self._dry_pos.unrealized_pnl = self._pnl_inr(
+                                            avg, mark, abs(active), self._dry_pos.side,
+                                        )
                                     self.portfolio.update_positions([self._dry_pos])
-                                break
+                                else:
+                                    matched_flat = True
+                            ghost = matched_flat or (
+                                self._dry_pos.symbol not in open_pairs
+                                and time.time() - self._last_fill_ts > 25
+                            )
+                            if ghost:
+                                print(
+                                    f"[SYNC] Exchange flat for {self._dry_pos.symbol} — clearing local ghost"
+                                )
+                                self._dry_pos = None
+                                self.cycle.clear_trade()
+                                self._last_flatten_ts = time.time()
+                                await self.store.save_trade_plan({})
+                                self.portfolio.update_positions([])
                         except Exception as e:
                             print(f"[SYNC] live overlay: {e}")
                     await asyncio.sleep(10)
@@ -1762,7 +1867,7 @@ class RubaihBot:
                         self.cycle.push_price(mark, pair)
                     upnl = 0.0
                     if mark > 0 and avg > 0:
-                        upnl = (mark - avg) * active
+                        upnl = self._pnl_inr(avg, mark, abs(active), side)
                     positions.append(Position(
                         symbol=pair,
                         product_id=str(rp.get("id", pair)),
@@ -1773,6 +1878,9 @@ class RubaihBot:
                     ))
                 if len(positions) > 1:
                     positions = positions[:1]
+                # Avoid resurrecting a just-flattened position from exchange lag
+                if positions and time.time() - self._last_flatten_ts < 20:
+                    positions = []
                 if positions:
                     await self._set_active_pair(positions[0].symbol)
                     # Mirror into cycle tracker so exits/dashboard stay consistent
@@ -1891,7 +1999,9 @@ class RubaihBot:
                             except Exception:
                                 pass
                     else:
-                        self.cycle.clear_trade()
+                        # Flat: keep restored plan only if we somehow still have peaks — normally clear
+                        if self.cycle._plan_pair and not self._dry_pos:
+                            self.cycle.clear_trade()
                         mids = {
                             p: self._pair_mids[p]
                             for p in self._scan_pairs
@@ -1905,20 +2015,29 @@ class RubaihBot:
                             p: (self.products[p].min_quantity if p in self.products else 0.001)
                             for p in mids
                         }
-                        signal = self.cycle.pick_entry(mids, min_qty_by_pair)
+                        lev_by_pair = {p: float(self._leverage_for(p)) for p in mids}
+                        step_by_pair = {
+                            p: (self.products[p].quantity_increment if p in self.products else 0.001)
+                            for p in mids
+                        }
+                        signal = self.cycle.pick_entry(
+                            mids, min_qty_by_pair,
+                            leverage_by_pair=lev_by_pair,
+                            step_by_pair=step_by_pair,
+                        )
                     if signal and signal.hedge_size != 0:
                         if signal.pair:
                             await self._set_active_pair(signal.pair)
                         await self._log(f"[CYCLE] {signal.reason}")
                         # Exits must never be rate-limited or soft-blocked
                         is_exit = signal.hedge_size < 0
-                        await self._execute_hedge(signal, force=is_exit)
+                        ok = await self._execute_hedge(signal, force=is_exit)
                         await self._publish_snapshot()
-                        if is_exit:
-                            await self.store.save_trade_plan({})
-                            await self._refresh_free_capital(force=True)
-                        else:
-                            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                        if ok:
+                            if is_exit:
+                                await self.store.save_trade_plan({})
+                            else:
+                                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
                             await self._refresh_free_capital(force=True)
                 else:
                     signal = self.strategist.evaluate(greeks, spot if spot > 0 else next(iter(self._pair_mids.values()), 0.0))
@@ -1930,18 +2049,18 @@ class RubaihBot:
                 await self._log(f"[LOOP] Error: {e}")
             await asyncio.sleep(1)
 
-    async def _execute_hedge(self, signal: HedgeSignal, force: bool = False):
+    async def _execute_hedge(self, signal: HedgeSignal, force: bool = False) -> bool:
         if not force and not self.risk.alive:
             print("[HEDGE] Blocked — kill switch active")
-            return
+            return False
         if not self.risk.rate_limit_ok() and not force:
             print("[HEDGE] Rate limited")
-            return
+            return False
         perp_symbol = signal.pair or self._active_pair or CFG["trading"]["perp_symbol"]
         perp_prod = self.products.get(perp_symbol)
         if not perp_prod:
             print(f"[HEDGE] Perp {perp_symbol} not found")
-            return
+            return False
         if not signal.pair:
             signal.pair = perp_symbol
 
@@ -1951,29 +2070,30 @@ class RubaihBot:
         spot = self._mid_for(perp_symbol)
         if spot <= 0:
             spot = self.portfolio.spot_prices.get(perp_prod.underlying, 0.0)
+        lev = self._leverage_for(perp_symbol)
 
-        async def _place(qty: float):
+        async def _place(qty: float) -> bool:
             if qty <= 0 or qty < perp_prod.min_quantity:
                 await self._log(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
                 return False
-            live_ok = self._live and self.client and self.client._auth_ok
-            if not live_ok:
-                if self._live and self.client and not self.client._auth_ok:
-                    if not getattr(self, "_live_block_warned", False):
-                        self._live_block_warned = True
-                        await self._log(
-                            "[LIVE BLOCKED] CoinDCX auth failed — simulating fills until AUTH OK. "
-                            "Set LIVE_TRADING=false or fix API keys."
-                        )
-                    await self._log(f"[SIM] Would {side.value} {qty} {perp_symbol} @ ~{spot} (auth blocked)")
-                else:
-                    await self._log(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
+            # LIVE + auth fail: never invent a position
+            if self._live and self.client and not self.client._auth_ok:
+                if not getattr(self, "_live_block_warned", False):
+                    self._live_block_warned = True
+                    await self._log(
+                        "[LIVE BLOCKED] CoinDCX auth failed — no fills until AUTH OK. "
+                        "Fix API keys or set LIVE_TRADING=false for dry-run."
+                    )
+                await self._log(f"[LIVE BLOCKED] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
+                return False
+            if not self._live or not self.client:
+                await self._log(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot} lev={lev}x")
                 await self.store.save_hedge(signal, spot, size=qty)
                 self._apply_dry_fill(perp_symbol, side, qty, spot)
                 return True
 
-            result = await self.client.place_order(perp_prod.pair, side, qty, "market", self._leverage)
-            await self._log(f"[HEDGE] LIVE order: {result}")
+            result = await self.client.place_order(perp_prod.pair, side, qty, "market", lev)
+            await self._log(f"[HEDGE] LIVE order @{lev}x: {result}")
             if isinstance(result, dict) and (
                 result.get("status") == "error"
                 or result.get("code") in (400, 401, 403, 500, "400", "401", "403", "500")
@@ -1990,13 +2110,15 @@ class RubaihBot:
             slices = min(slices, cfg.get("twap_slices", 3) if not force else max(slices, 1))
             slice_size = self._round_qty(size / slices, perp_prod)
             print(f"[HEDGE] TWAP: {slices} slices of {slice_size} on {perp_symbol}{' (force)' if force else ''}")
+            any_ok = False
             for i in range(slices):
-                await _place(slice_size)
+                if await _place(slice_size):
+                    any_ok = True
                 if i < slices - 1:
                     await asyncio.sleep(cfg["twap_interval_sec"] if not force else max(2, cfg["twap_interval_sec"] // 2))
-        else:
-            qty = self._round_qty(size, perp_prod)
-            await _place(qty)
+            return any_ok
+        qty = self._round_qty(size, perp_prod)
+        return await _place(qty)
 
     def _apply_dry_fill(self, symbol: str, side: Side, qty: float, price: float):
         """Update local cycle position (dry-run and live) so dashboard reflects fills."""
@@ -2011,6 +2133,7 @@ class RubaihBot:
             self.portfolio.update_spot(self.products[symbol].underlying, price)
             self._pair_mids[symbol] = price
 
+        self._last_fill_ts = time.time()
         pos = self._dry_pos
         if side == Side.BUY:
             if pos and pos.side == "buy" and pos.symbol == symbol:
@@ -2022,20 +2145,21 @@ class RubaihBot:
                     symbol=symbol, product_id=f"dry-{symbol}", side="buy",
                     size=qty, entry_price=price, unrealized_pnl=0.0,
                 )
-            # Lock TP/SL immediately at fill price
             if self._dry_pos:
                 self.cycle.arm_trade(symbol, self._dry_pos.entry_price, self._dry_pos.size)
         else:  # SELL
-            if pos and pos.side == "buy":
+            if pos and pos.side == "buy" and pos.symbol == symbol:
                 remain = pos.size - qty
                 if remain <= 1e-12:
                     self._dry_pos = None
                     self.cycle.clear_trade()
+                    self._last_flatten_ts = time.time()
                 else:
                     pos.size = remain
             else:
                 self._dry_pos = None
                 self.cycle.clear_trade()
+                self._last_flatten_ts = time.time()
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
         else:
@@ -2070,6 +2194,7 @@ class RubaihBot:
                 )
                 await self._execute_hedge(signal, force=True)
         self._dry_pos = None
+        self._last_flatten_ts = time.time()
         self._running = False
         await self.store.set_engine_status("stopped")
 
