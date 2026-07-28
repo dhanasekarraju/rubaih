@@ -15,8 +15,8 @@ trading:
   perp_symbol: "B-BTC_USDT"
   mode: futures_cycle
 
-  # Fallback estimate only — live free margin from CoinDCX preferred
-  capital_inr: 5000
+  # Fallback only for dry-run. LIVE uses wallet API or RUBAIH_FREE_CAPITAL_INR.
+  capital_inr: 1000
   leverage: 10
   usdt_inr: 87
 
@@ -25,11 +25,13 @@ trading:
   margin_use_max_frac: 0.60
 
   scan_enabled: true
+  # Majors only — do NOT auto-add meme/illiquid pairs (CHIP etc.)
   scan_pairs:
     - B-BTC_USDT
     - B-ETH_USDT
     - B-SOL_USDT
-  scan_max_pairs: 20
+  scan_fill_extras: false
+  scan_max_pairs: 3
   scan_interval_sec: 5
 
   delta_threshold: 0.0005

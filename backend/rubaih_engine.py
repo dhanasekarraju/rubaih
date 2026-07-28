@@ -54,6 +54,11 @@ MARGIN_CCY = CFG["exchange"].get("margin_currency", "USDT")
 API_KEY = _env_secret("COINDCX_API_KEY")
 API_SECRET = _env_secret("COINDCX_API_SECRET")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
+# Manual free-futures INR when CoinDCX wallet endpoints 404 (set to YOUR Futures wallet ₹)
+try:
+    FREE_CAPITAL_INR_ENV = float(os.getenv("RUBAIH_FREE_CAPITAL_INR") or os.getenv("FREE_CAPITAL_INR") or 0)
+except (TypeError, ValueError):
+    FREE_CAPITAL_INR_ENV = 0.0
 
 # ==============================================================================
 # MODELS
@@ -177,14 +182,20 @@ class CoinDCXClient:
             except Exception:
                 return {}
 
-    async def _signed_post(self, path: str, body: Optional[Dict] = None):
+    async def _signed_request(self, method: str, path: str, body: Optional[Dict] = None):
+        """Signed CoinDCX call. Some futures wallet endpoints are GET-with-body (per docs)."""
         extra = {k: v for k, v in dict(body or {}).items() if k != "timestamp"}
         body = {"timestamp": self._timestamp(), **extra}
         headers, payload = self.auth.sign(body)
         url = f"{REST_URL}{path}"
-        async with self.session.post(
-            url, data=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
+        method = (method or "POST").upper()
+        timeout = aiohttp.ClientTimeout(total=15)
+        if method == "GET":
+            # Docs use GET with signed JSON body for wallets / cross_margin_details
+            req = self.session.get(url, data=payload, headers=headers, timeout=timeout)
+        else:
+            req = self.session.post(url, data=payload, headers=headers, timeout=timeout)
+        async with req as resp:
             text = await resp.text()
             try:
                 data = json.loads(text) if text else {}
@@ -208,12 +219,23 @@ class CoinDCXClient:
                         "IP whitelist matches this VPS, recreate engine after .env edit"
                     )
             elif resp.status >= 400:
-                print(f"[API ERROR] {path} ({resp.status}): {data}")
+                # Throttle noisy 404s on optional capital endpoints
+                key = f"{method}:{path}:{resp.status}"
+                counts = getattr(self, "_api_err_counts", {})
+                counts[key] = counts.get(key, 0) + 1
+                self._api_err_counts = counts
+                if counts[key] <= 2 or counts[key] % 30 == 0:
+                    print(f"[API ERROR] {method} {path} ({resp.status}): {data}")
             else:
                 self._auth_errors = 0
                 self._auth_ok = True
-            # CoinDCX futures/positions returns a JSON array — do not coerce to {}
             return data
+
+    async def _signed_post(self, path: str, body: Optional[Dict] = None):
+        return await self._signed_request("POST", path, body)
+
+    async def _signed_get(self, path: str, body: Optional[Dict] = None):
+        return await self._signed_request("GET", path, body)
 
     async def verify_credentials(self) -> bool:
         """
@@ -356,16 +378,47 @@ class CoinDCXClient:
         """Live free futures margin (available_balance_cross)."""
         if not self._auth_ok:
             return {}
-        data = await self._signed_post(
-            "/exchange/v1/derivatives/futures/positions/cross_margin_details",
+        # Docs disagree POST vs GET — try both; include margin currency for INR-M
+        bodies = [
             {},
-        )
-        return data if isinstance(data, dict) else {}
+            {"margin_currency_short_name": self.margin},
+            {"margin_currency_short_name": [self.margin]},
+        ]
+        for body in bodies:
+            for method in ("GET", "POST"):
+                data = await self._signed_request(
+                    method,
+                    "/exchange/v1/derivatives/futures/positions/cross_margin_details",
+                    body,
+                )
+                if isinstance(data, dict) and data.get("available_balance_cross") is not None:
+                    return data
+                if isinstance(data, dict) and data.get("code") not in (404, "404", 400, "400"):
+                    if any(k in data for k in ("available_balance_cross", "total_wallet_balance", "withdrawable_balance")):
+                        return data
+        return {}
 
     async def get_futures_wallets(self) -> List[Dict]:
+        """Futures wallet balances."""
         if not self._auth_ok:
             return []
-        data = await self._signed_post("/exchange/v1/derivatives/futures/wallets", {})
+        for method in ("GET", "POST"):
+            data = await self._signed_request(
+                method, "/exchange/v1/derivatives/futures/wallets", {}
+            )
+            if isinstance(data, list) and data:
+                return data
+            if isinstance(data, dict):
+                rows = data.get("data", data.get("result", []))
+                if isinstance(rows, list) and rows:
+                    return rows
+        return []
+
+    async def get_user_balances(self) -> List[Dict]:
+        """Spot/user balances (fallback). Prefer futures wallet when available."""
+        if not self._auth_ok:
+            return []
+        data = await self._signed_post("/exchange/v1/users/balances", {})
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
@@ -1049,6 +1102,47 @@ class DataStore:
         except Exception:
             pass
 
+    async def save_capital_ledger(self, free_inr: float, source: str, locked_margin: float = 0.0):
+        """Persist free futures capital so it survives restarts and updates after each trade."""
+        try:
+            payload = {
+                "free_inr": float(free_inr),
+                "locked_margin": float(locked_margin),
+                "source": source,
+                "ts": time.time(),
+            }
+            await self.rd.set("rubaih:capital_ledger", json.dumps(payload))
+            await self.rd.hset(
+                "rubaih:settings",
+                mapping={
+                    "free_capital_inr": f"{free_inr:.2f}",
+                    "trade_budget_inr": f"{max(0.0, free_inr) * float(CFG['trading'].get('margin_use_frac', 0.55)):.2f}",
+                    "capital_source": source,
+                    "locked_margin_inr": f"{locked_margin:.2f}",
+                },
+            )
+        except Exception:
+            pass
+
+    async def load_capital_ledger(self) -> Dict:
+        try:
+            raw = await self.rd.get("rubaih:capital_ledger")
+            if raw:
+                return json.loads(raw)
+            # legacy: settings hash only
+            s = await self.rd.hgetall("rubaih:settings") or {}
+            free = float(s.get("free_capital_inr") or 0)
+            if free > 0:
+                return {
+                    "free_inr": free,
+                    "locked_margin": float(s.get("locked_margin_inr") or 0),
+                    "source": s.get("capital_source") or "redis_settings",
+                    "ts": 0,
+                }
+        except Exception:
+            pass
+        return {}
+
     async def save_trade_plan(self, plan: Dict):
         try:
             if plan and plan.get("pair"):
@@ -1127,6 +1221,10 @@ class RubaihBot:
         self._ws_pair = self._active_pair
         self._last_fill_ts = 0.0
         self._last_flatten_ts = 0.0
+        self._capital_live_ok = False
+        self._margin_locked = 0.0
+        self._capital_source = "unset"
+        self._ledger_seeded = False
 
     def _leverage_for(self, pair: Optional[str] = None) -> int:
         """Config leverage capped by instrument max (e.g. SOL often 5x)."""
@@ -1300,35 +1398,70 @@ class RubaihBot:
         )
 
     @staticmethod
-    def _parse_free_margin_inr(payload) -> float:
+    def _parse_free_margin_inr(payload, prefer_ccy: str = "INR") -> float:
         """Extract available INR futures margin from CoinDCX wallet / cross-margin payloads."""
+        prefer = (prefer_ccy or "INR").upper()
         keys = (
             "available_balance_cross",
+            "available_balance_isolated",
+            "withdrawable_balance",
             "available_balance",
             "available_margin",
             "free_balance",
+            "available_wallet_balance",
             "balance",
             "wallet_balance",
         )
 
+        def row_ccy(d: Dict) -> str:
+            return str(
+                d.get("currency")
+                or d.get("currency_short_name")
+                or d.get("margin_currency")
+                or d.get("margin_currency_short_name")
+                or ""
+            ).upper()
+
         def from_dict(d: Dict) -> float:
             if not isinstance(d, dict):
                 return 0.0
-            ccy = str(d.get("currency") or d.get("currency_short_name") or d.get("margin_currency") or "").upper()
-            if ccy and ccy not in ("INR", "INRF", "INR-M", "INRM"):
-                # Still allow if key names clearly mark available balance
-                pass
             for k in keys:
-                if k in d and d[k] is not None:
+                if k not in d or d[k] is None:
+                    continue
+                try:
+                    v = float(d[k])
+                except (TypeError, ValueError):
+                    continue
+                if k == "balance":
                     try:
-                        v = float(d[k])
-                        if v > 0:
-                            return v
+                        locked = float(d.get("locked_balance") or 0)
+                        v = max(0.0, v - locked)
                     except (TypeError, ValueError):
-                        continue
+                        pass
+                if v > 0:
+                    return v
             return 0.0
 
+        def best_from_list(items: list) -> float:
+            preferred = 0.0
+            any_pos = 0.0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                v = from_dict(item)
+                if v <= 0:
+                    continue
+                ccy = row_ccy(item)
+                if prefer in ccy or ccy == prefer:
+                    preferred = max(preferred, v)
+                elif not ccy:
+                    preferred = max(preferred, v)
+                else:
+                    any_pos = max(any_pos, v)
+            return preferred or any_pos
+
         if isinstance(payload, dict):
+            # Top-level cross_margin_details (often no currency field)
             direct = from_dict(payload)
             if direct > 0:
                 return direct
@@ -1339,69 +1472,162 @@ class RubaihBot:
                     if v > 0:
                         return v
                 if isinstance(nested, list):
-                    for item in nested:
-                        v = from_dict(item) if isinstance(item, dict) else 0.0
-                        if v > 0:
-                            # Prefer INR rows when present
-                            ccy = str((item or {}).get("currency") or (item or {}).get("currency_short_name") or "").upper()
-                            if not ccy or "INR" in ccy:
-                                return v
-                    # fallback first positive
-                    for item in nested:
-                        v = from_dict(item) if isinstance(item, dict) else 0.0
-                        if v > 0:
-                            return v
-        if isinstance(payload, list):
-            for item in payload:
-                v = from_dict(item) if isinstance(item, dict) else 0.0
-                if v > 0:
-                    ccy = str((item or {}).get("currency") or (item or {}).get("currency_short_name") or "").upper()
-                    if not ccy or "INR" in ccy:
+                    v = best_from_list(nested)
+                    if v > 0:
                         return v
-            for item in payload:
-                v = from_dict(item) if isinstance(item, dict) else 0.0
-                if v > 0:
-                    return v
+        if isinstance(payload, list):
+            return best_from_list(payload)
         return 0.0
 
+    async def _publish_capital(self, free: float, source: str):
+        self.cycle.set_free_capital(free)
+        self._capital_live_ok = free > 0
+        self._capital_source = source
+        try:
+            await self.store.save_capital_ledger(free, source, self._margin_locked)
+        except Exception:
+            pass
+
+    def _ledger_adjust_sync(self, delta: float, reason: str):
+        """Update free capital in-memory after fills (persisted async)."""
+        new_free = max(0.0, float(self.cycle.free_capital_inr) + float(delta))
+        self.cycle.set_free_capital(new_free)
+        self._capital_live_ok = True
+        self._capital_source = "ledger"
+        print(
+            f"[CAPITAL] {reason}: Δ₹{delta:+.0f} → free=₹{new_free:.0f} "
+            f"budget=₹{self.cycle.trade_margin_budget():.0f} locked=₹{self._margin_locked:.0f}"
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self.store.save_capital_ledger(new_free, "ledger", self._margin_locked)
+            )
+        except RuntimeError:
+            pass
+
     async def _refresh_free_capital(self, force: bool = False):
-        """Pull live free futures margin; size trades off that (fallback: capital_inr)."""
+        """
+        Always keep free capital current:
+        1) CoinDCX wallet APIs when they work (authoritative)
+        2) Else auto ledger (updated after every fill) — no VPS edits per trade
+        3) Seed once from env/config only if ledger empty
+        """
         now = time.time()
         last = getattr(self, "_last_capital_refresh", 0.0)
         if not force and now - last < 20:
             return
         self._last_capital_refresh = now
         free = 0.0
+        source = ""
         try:
             if self.client and self.client._auth_ok:
                 details = await self.client.get_cross_margin_details()
-                free = self._parse_free_margin_inr(details)
+                free = self._parse_free_margin_inr(details, MARGIN_CCY)
+                if free > 0:
+                    source = "exchange:cross_margin"
                 if free <= 0:
                     wallets = await self.client.get_futures_wallets()
-                    free = self._parse_free_margin_inr(wallets)
+                    free = self._parse_free_margin_inr(wallets, MARGIN_CCY)
+                    if free > 0:
+                        source = "exchange:futures_wallets"
+                # Spot INR is NOT futures free — only warn, never size from it for LIVE
+                if free <= 0 and not self._live:
+                    bals = await self.client.get_user_balances()
+                    free = self._parse_free_margin_inr(bals, MARGIN_CCY)
+                    if free > 0:
+                        source = "spot_balances(dry-run)"
         except Exception as e:
-            print(f"[CAPITAL] refresh failed: {e}")
+            print(f"[CAPITAL] exchange refresh failed: {e}")
+
         if free > 0:
-            self.cycle.set_free_capital(free)
-            try:
-                await self.store.rd.hset(
-                    "rubaih:settings",
-                    mapping={
-                        "free_capital_inr": f"{free:.2f}",
-                        "trade_budget_inr": f"{self.cycle.trade_margin_budget():.2f}",
-                    },
-                )
-            except Exception:
-                pass
+            if source.startswith("exchange:") and free < 200 and MARGIN_CCY.upper() == "INR":
+                converted = free * float(self.cycle.usdt_inr)
+                if converted > free * 2:
+                    print(
+                        f"[CAPITAL] exchange {free:.4f} looks USDT-scale → ₹{converted:.0f}"
+                    )
+                    free = converted
+            # If we have a locked position, exchange "available" is already net of margin;
+            # our ledger free is also "available to open". Trust exchange available as free.
+            await self._publish_capital(free, source)
             if force or now - getattr(self, "_last_capital_log", 0.0) > 60:
                 self._last_capital_log = now
                 print(
                     f"[CAPITAL] free=₹{free:.0f} budget=₹{self.cycle.trade_margin_budget():.0f} "
-                    f"({self.cycle.margin_use_frac:.0%}–{self.cycle.margin_use_max_frac:.0%})"
+                    f"via {source}"
+                )
+            return
+
+        # --- No exchange balance: keep / restore auto ledger ---
+        if self.cycle.free_capital_inr > 0 and (
+            self._capital_live_ok or self._capital_source == "ledger"
+        ):
+            await self._publish_capital(self.cycle.free_capital_inr, "ledger")
+            if force or now - getattr(self, "_last_capital_log", 0.0) > 90:
+                self._last_capital_log = now
+                print(
+                    f"[CAPITAL] ledger free=₹{self.cycle.free_capital_inr:.0f} "
+                    f"(auto-updates after each trade; wallet API still 404)"
+                )
+            return
+
+        ledger = await self.store.load_capital_ledger()
+        ledger_free = float(ledger.get("free_inr") or 0)
+        if ledger_free > 0:
+            self._margin_locked = float(ledger.get("locked_margin") or 0)
+            await self._publish_capital(ledger_free, "ledger:redis")
+            print(
+                f"[CAPITAL] restored ledger free=₹{ledger_free:.0f} "
+                f"locked=₹{self._margin_locked:.0f}"
+            )
+            return
+
+        # Seed once only (env preferred, then config). Never re-seed over ledger.
+        if not self._ledger_seeded:
+            seed = FREE_CAPITAL_INR_ENV if FREE_CAPITAL_INR_ENV > 0 else 0.0
+            if seed <= 0 and not self._live:
+                seed = float(self.cycle.capital_inr or 0)
+            if seed > 0:
+                self._ledger_seeded = True
+                await self._publish_capital(
+                    seed,
+                    "seed:env" if FREE_CAPITAL_INR_ENV > 0 else "seed:config",
+                )
+                print(
+                    f"[CAPITAL] seeded free=₹{seed:.0f} once — will auto-track after trades. "
+                    f"Set RUBAIH_FREE_CAPITAL_INR only for first seed if wallet API 404s."
+                )
+                return
+
+        if self._live:
+            self._capital_live_ok = False
+            if now - getattr(self, "_last_capital_fail_log", 0.0) > 60:
+                self._last_capital_fail_log = now
+                print(
+                    "[CAPITAL] LIVE: no free capital yet. One-time: set "
+                    "RUBAIH_FREE_CAPITAL_INR=<Futures INR> in .env, restart once — "
+                    "after that the bot auto-updates free capital every trade."
                 )
         else:
-            # Dry-run / auth-off: use configured capital as free
-            self.cycle.set_free_capital(self.cycle.capital_inr)
+            await self._publish_capital(float(self.cycle.capital_inr or 1000), "seed:config")
+
+    async def note_insufficient_funds(self, attempted_margin: float = 0.0):
+        """After CoinDCX Insufficient funds — shrink ledger immediately."""
+        cur = max(self.cycle.free_capital_inr, 0.0)
+        if attempted_margin > 0:
+            new_free = max(50.0, attempted_margin * 0.65 / max(self.cycle.margin_use_frac, 0.1))
+            new_free = min(new_free, cur * 0.65) if cur > 0 else new_free
+        else:
+            new_free = max(50.0, cur * 0.55) if cur > 0 else 200.0
+        self._margin_locked = 0.0
+        await self._publish_capital(new_free, "ledger:insuff_cut")
+        self.cycle._last_signal = time.time()
+        print(
+            f"[CAPITAL] Insufficient funds → ledger cut to ₹{new_free:.0f} "
+            f"(budget ₹{self.cycle.trade_margin_budget():.0f})"
+        )
+
     async def command_listener(self):
         """Honor kill-switch / settings from authenticated API. Reconnects if Redis drops."""
         while self._running:
@@ -1497,18 +1723,22 @@ class RubaihBot:
         if not majors:
             majors = [CFG["trading"]["perp_symbol"]]
 
-        # Fill remaining slots with other active INR pairs (skip obvious locked names)
+        fill_extras = bool(CFG["trading"].get("scan_fill_extras", False))
         extras = []
-        for pair in instruments:
-            if not isinstance(pair, str) or pair in majors:
-                continue
-            up = pair.upper()
-            if "SLX" in up:
-                continue
-            extras.append(pair)
+        if fill_extras:
+            for pair in instruments:
+                if not isinstance(pair, str) or pair in majors:
+                    continue
+                up = pair.upper()
+                if "SLX" in up:
+                    continue
+                extras.append(pair)
         to_load = majors + extras
         to_load = to_load[: max(self._scan_max, len(majors))]
-
+        print(
+            f"[RUBAIH] Pair universe: {len(majors)} configured"
+            + (f" + {len(extras)} extras" if extras else " (majors only — no meme fill)")
+        )
         for pair in to_load:
             try:
                 details = await self.client.get_instrument(pair)
@@ -2002,29 +2232,32 @@ class RubaihBot:
                         # Flat: keep restored plan only if we somehow still have peaks — normally clear
                         if self.cycle._plan_pair and not self._dry_pos:
                             self.cycle.clear_trade()
-                        mids = {
-                            p: self._pair_mids[p]
-                            for p in self._scan_pairs
-                            if p in self._pair_mids and self._pair_mids[p] > 0
-                        }
-                        if not self._scan_enabled:
-                            ap = self._active_pair
-                            if ap in self._pair_mids:
-                                mids = {ap: self._pair_mids[ap]}
-                        min_qty_by_pair = {
-                            p: (self.products[p].min_quantity if p in self.products else 0.001)
-                            for p in mids
-                        }
-                        lev_by_pair = {p: float(self._leverage_for(p)) for p in mids}
-                        step_by_pair = {
-                            p: (self.products[p].quantity_increment if p in self.products else 0.001)
-                            for p in mids
-                        }
-                        signal = self.cycle.pick_entry(
-                            mids, min_qty_by_pair,
-                            leverage_by_pair=lev_by_pair,
-                            step_by_pair=step_by_pair,
-                        )
+                        if self._live and not getattr(self, "_capital_live_ok", False):
+                            signal = None
+                        else:
+                            mids = {
+                                p: self._pair_mids[p]
+                                for p in self._scan_pairs
+                                if p in self._pair_mids and self._pair_mids[p] > 0
+                            }
+                            if not self._scan_enabled:
+                                ap = self._active_pair
+                                if ap in self._pair_mids:
+                                    mids = {ap: self._pair_mids[ap]}
+                            min_qty_by_pair = {
+                                p: (self.products[p].min_quantity if p in self.products else 0.001)
+                                for p in mids
+                            }
+                            lev_by_pair = {p: float(self._leverage_for(p)) for p in mids}
+                            step_by_pair = {
+                                p: (self.products[p].quantity_increment if p in self.products else 0.001)
+                                for p in mids
+                            }
+                            signal = self.cycle.pick_entry(
+                                mids, min_qty_by_pair,
+                                leverage_by_pair=lev_by_pair,
+                                step_by_pair=step_by_pair,
+                            )
                     if signal and signal.hedge_size != 0:
                         if signal.pair:
                             await self._set_active_pair(signal.pair)
@@ -2100,6 +2333,14 @@ class RubaihBot:
                 or result.get("error")
             ):
                 await self._log(f"[HEDGE] Order rejected — not updating position: {result}")
+                msg = str(result.get("message") or result.get("error") or "").lower()
+                if "insufficient" in msg:
+                    # Estimate margin that just failed
+                    try:
+                        m = (qty * spot * self.cycle.usdt_inr) / max(lev, 1)
+                    except Exception:
+                        m = self.cycle.trade_margin_budget()
+                    await self.note_insufficient_funds(m)
                 return False
             await self.store.save_hedge(signal, spot, size=qty)
             self._apply_dry_fill(perp_symbol, side, qty, spot)
@@ -2134,6 +2375,9 @@ class RubaihBot:
             self._pair_mids[symbol] = price
 
         self._last_fill_ts = time.time()
+        lev = max(1, self._leverage_for(symbol))
+        notional = qty * price * float(self.cycle.usdt_inr)
+        fee = notional * float(self.cycle.taker_fee)
         pos = self._dry_pos
         if side == Side.BUY:
             if pos and pos.side == "buy" and pos.symbol == symbol:
@@ -2146,20 +2390,46 @@ class RubaihBot:
                     size=qty, entry_price=price, unrealized_pnl=0.0,
                 )
             if self._dry_pos:
+                prev_locked = float(self._margin_locked or 0)
                 self.cycle.arm_trade(symbol, self._dry_pos.entry_price, self._dry_pos.size)
+                new_locked = float(self.cycle._margin_used or 0)
+                self._margin_locked = new_locked
+                # Free capital drops by incremental margin + fee
+                self._ledger_adjust_sync(
+                    -(max(0.0, new_locked - prev_locked) + fee),
+                    f"ENTRY {symbol} margin→₹{new_locked:.0f}",
+                )
         else:  # SELL
             if pos and pos.side == "buy" and pos.symbol == symbol:
+                entry = pos.entry_price
+                closed = min(qty, pos.size)
+                pnl = self._pnl_inr(entry, price, closed, "buy")
                 remain = pos.size - qty
                 if remain <= 1e-12:
+                    release = float(self._margin_locked or self.cycle._margin_used or 0)
                     self._dry_pos = None
                     self.cycle.clear_trade()
                     self._last_flatten_ts = time.time()
+                    self._margin_locked = 0.0
+                    # Margin returns + realized PnL − exit fee
+                    self._ledger_adjust_sync(
+                        release + pnl - fee,
+                        f"EXIT {symbol} pnl=₹{pnl:.0f} released=₹{release:.0f}",
+                    )
                 else:
+                    frac = closed / max(pos.size, 1e-12)
+                    release = float(self._margin_locked or 0) * frac
+                    self._margin_locked = max(0.0, float(self._margin_locked or 0) - release)
                     pos.size = remain
+                    self._ledger_adjust_sync(
+                        release + pnl - fee,
+                        f"PARTIAL_EXIT {symbol} pnl=₹{pnl:.0f}",
+                    )
             else:
                 self._dry_pos = None
                 self.cycle.clear_trade()
                 self._last_flatten_ts = time.time()
+                self._margin_locked = 0.0
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
         else:
