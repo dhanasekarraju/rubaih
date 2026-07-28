@@ -509,29 +509,36 @@ class FuturesCycleStrategist:
         self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 90))
         self.lookback = int(scfg.get("momentum_lookback", 24))
         self.entry_move_pct = float(scfg.get("entry_move_pct", 0.0012))
-        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.005))
-        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.0035))
-        self.max_hold_sec = float(scfg.get("max_hold_sec", 1800))
+        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.004))
+        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.0025))
+        self.max_loss_inr = float(scfg.get("max_loss_inr", 200))
+        self.max_hold_sec = float(scfg.get("max_hold_sec", 1200))
         self.allow_short = bool(scfg.get("allow_short", False))
-        # Prefer INR margin target (works for BTC/ETH/SOL). Legacy position_size_btc is only a soft cap if set.
-        self.target_margin_inr = float(tcfg.get("target_margin_inr", 2000))
-        self.target_size = float(scfg.get("position_size_btc", 0) or 0)  # 0 = uncapped by coin units
+        self.target_margin_inr = float(tcfg.get("target_margin_inr", 1200))
+        self.max_margin_inr = float(tcfg.get("max_margin_inr", 1500))
+        self.target_size = float(scfg.get("position_size_btc", 0) or 0)
         self.capital_inr = float(tcfg.get("capital_inr", 5000))
         self.leverage = int(tcfg.get("leverage", 10))
         self.usdt_inr = float(tcfg.get("usdt_inr", 87))
         self.margin_buffer = float(tcfg.get("margin_buffer", 0.85))
         self.taker_fee = float(CFG.get("exchange", {}).get("taker_fee", 0.00075))
         self.min_interval = float(tcfg.get("min_hedge_interval_sec", 45))
-        # Trailing lock: sell if unrealized PnL gives back N INR from peak
         self.trail_giveback_inr = float(scfg.get("profit_trail_giveback_inr", 50))
-        self.trail_arm_inr = float(scfg.get("profit_trail_arm_inr", 80))
+        self.trail_arm_inr = float(scfg.get("profit_trail_arm_inr", 100))
         self._last_signal = 0.0
         self._entry_ts = 0.0
         self._peak_pnl_inr = 0.0
+        self._peak_price = 0.0
+        self._entry_price = 0.0
+        self._tp_price = 0.0
+        self._sl_price = 0.0
+        self._plan_pair: Optional[str] = None
+        self._plan_size = 0.0
         self._prices: Dict[str, Deque[float]] = {}
         self._last_scan_log = 0.0
         self._last_entry_pair: Optional[str] = None
         self._last_scan_msg: Optional[str] = None
+        self._last_hold_log = 0.0
 
     def _buf(self, pair: str) -> Deque[float]:
         if pair not in self._prices:
@@ -544,25 +551,32 @@ class FuturesCycleStrategist:
             self._buf(key).append(float(mid))
 
     def affordable_qty(self, spot: float, min_qty: float) -> float:
-        """Size from target INR margin × leverage (same ₹ for BTC/ETH/SOL)."""
+        """Size from target INR margin × leverage. Never exceed max_margin_inr."""
         if spot <= 0 or self.usdt_inr <= 0 or self.leverage <= 0:
             return 0.0
         usable_inr = self.capital_inr * self.margin_buffer
-        target_margin = min(self.target_margin_inr, usable_inr)
+        hard_cap = min(self.max_margin_inr, usable_inr)
+        target_margin = min(self.target_margin_inr, hard_cap)
         if target_margin <= 0:
             return 0.0
         notional_inr = target_margin * self.leverage
         qty = notional_inr / (spot * self.usdt_inr)
-        max_qty = (usable_inr * self.leverage) / (spot * self.usdt_inr)
+        max_qty = (hard_cap * self.leverage) / (spot * self.usdt_inr)
         qty = min(qty, max_qty)
         if self.target_size > 0:
             qty = min(qty, self.target_size)
         if qty + 1e-12 < min_qty:
-            # Bump to exchange minimum if that min still fits capital
             min_margin = (min_qty * spot * self.usdt_inr) / self.leverage
-            if min_margin <= usable_inr * 1.001:
+            # Do NOT bump into a huge lot — skip pair if min lot > hard cap
+            if min_margin <= hard_cap * 1.001:
                 return float(min_qty)
             return 0.0
+        # Final guard
+        margin = (qty * spot * self.usdt_inr) / self.leverage
+        if margin > hard_cap * 1.02:
+            qty = (hard_cap * self.leverage) / (spot * self.usdt_inr)
+            if qty + 1e-12 < min_qty:
+                return 0.0
         return qty
 
     def _move_pct(self, pair: str, spot: float) -> Optional[float]:
@@ -574,6 +588,65 @@ class FuturesCycleStrategist:
         if base <= 0:
             return None
         return (spot - base) / base
+
+    def pnl_inr(self, entry: float, spot: float, size: float) -> float:
+        """Unrealized PnL in INR (USDT-quoted futures × FX)."""
+        return (spot - entry) * size * self.usdt_inr
+
+    def arm_trade(self, pair: str, entry: float, size: float):
+        """Lock TP/SL prices at buy time — checked every tick afterward."""
+        if entry <= 0 or size <= 0:
+            return
+        self._plan_pair = pair
+        self._plan_size = size
+        self._entry_price = entry
+        self._entry_ts = time.time()
+        self._tp_price = entry * (1.0 + self.take_profit_pct)
+        self._sl_price = entry * (1.0 - self.stop_loss_pct)
+        self._peak_price = entry
+        self._peak_pnl_inr = 0.0
+        self._last_entry_pair = pair
+        print(
+            f"[PLAN] {pair} entry={entry:.4f} size={size} "
+            f"TP={self._tp_price:.4f} (+{self.take_profit_pct:.2%}) "
+            f"SL={self._sl_price:.4f} (-{self.stop_loss_pct:.2%}) "
+            f"trail_arm=₹{self.trail_arm_inr:.0f} giveback=₹{self.trail_giveback_inr:.0f} "
+            f"max_loss=₹{self.max_loss_inr:.0f}"
+        )
+
+    def clear_trade(self):
+        self._plan_pair = None
+        self._plan_size = 0.0
+        self._entry_price = 0.0
+        self._tp_price = 0.0
+        self._sl_price = 0.0
+        self._peak_price = 0.0
+        self._peak_pnl_inr = 0.0
+        self._entry_ts = 0.0
+
+    def trade_plan_dict(self) -> Dict:
+        return {
+            "pair": self._plan_pair,
+            "entry": self._entry_price,
+            "tp": self._tp_price,
+            "sl": self._sl_price,
+            "peak_pnl_inr": self._peak_pnl_inr,
+            "peak_price": self._peak_price,
+            "size": self._plan_size,
+            "entry_ts": self._entry_ts,
+        }
+
+    def restore_trade_plan(self, data: Dict):
+        if not data:
+            return
+        self._plan_pair = data.get("pair")
+        self._entry_price = float(data.get("entry") or 0)
+        self._tp_price = float(data.get("tp") or 0)
+        self._sl_price = float(data.get("sl") or 0)
+        self._peak_pnl_inr = float(data.get("peak_pnl_inr") or 0)
+        self._peak_price = float(data.get("peak_price") or self._entry_price or 0)
+        self._plan_size = float(data.get("size") or 0)
+        self._entry_ts = float(data.get("entry_ts") or 0)
 
     def pick_entry(
         self,
@@ -604,7 +677,6 @@ class FuturesCycleStrategist:
             if qty <= 0:
                 skipped_size += 1
                 continue
-            # Light anti-stickiness: de-rank the pair we just traded
             score = move
             if pair == self._last_entry_pair:
                 score *= 0.85
@@ -627,21 +699,17 @@ class FuturesCycleStrategist:
 
         ranked.sort(reverse=True)
         _score, move, pair, spot, qty, margin_inr = ranked[0]
-        # Fee sanity: expected TP INR should beat round-trip fees
         notional_inr = qty * spot * self.usdt_inr
         fee_inr = notional_inr * self.taker_fee * 2
         tp_inr = notional_inr * self.take_profit_pct
-        if tp_inr < fee_inr * 1.5:
+        if tp_inr < fee_inr * 1.3:
             print(
-                f"[SCAN] skip {pair}: TP ₹{tp_inr:.0f} < 1.5× fees ₹{fee_inr:.0f} "
-                f"(raise target_margin_inr or take_profit_pct)"
+                f"[SCAN] skip {pair}: TP ₹{tp_inr:.0f} < 1.3× fees ₹{fee_inr:.0f}"
             )
             return None
 
         self._last_signal = now
-        self._entry_ts = now
-        self._peak_pnl_inr = 0.0
-        self._last_entry_pair = pair
+        # TP/SL locked in arm_trade() right after fill with real entry price
         return HedgeSignal(
             now, qty, 0.0, qty, "passive",
             f"ENTRY_LONG: {pair} move={move:.2%} size={qty:.6f} margin~₹{margin_inr:.0f}",
@@ -655,76 +723,102 @@ class FuturesCycleStrategist:
         position: Optional[Position],
         pair: str,
     ) -> Optional[HedgeSignal]:
-        """Manage open long: trail giveback / TP / SL / timeout.
+        """Exit using locked TP/SL prices + INR trail + hard max-loss.
 
-        Exits are NOT blocked by min_interval — that only gates new entries.
-        (Blocking exits after entry caused winners to ride into liquidation.)
+        Never blocked by entry cooldown / min_interval.
         """
         now = time.time()
         if spot <= 0 or not position or position.size <= 0:
             return None
 
         side = (position.side or "buy").lower()
-        entry = position.entry_price or 0.0
+        entry = position.entry_price or self._entry_price or 0.0
         size = position.size
-        if side == "buy" and entry > 0:
-            if self._entry_ts <= 0:
-                self._entry_ts = now
-            pnl_pct = (spot - entry) / entry
-            pnl_usdt = (spot - entry) * size
-            pnl_inr = pnl_usdt * self.usdt_inr
-            self._peak_pnl_inr = max(self._peak_pnl_inr, pnl_inr)
-            held = now - self._entry_ts
-            giveback = self._peak_pnl_inr - pnl_inr
-
-            # Trail lock: peaked in profit, then gave back ≥ ₹50 → sell now
-            if (
-                self._peak_pnl_inr >= self.trail_arm_inr
-                and giveback >= self.trail_giveback_inr
-            ):
+        if side != "buy" or entry <= 0:
+            if side == "sell":
+                self.clear_trade()
                 self._last_signal = now
-                peak = self._peak_pnl_inr
-                self._peak_pnl_inr = 0.0
                 return HedgeSignal(
-                    now, 0.0, size, -size, "immediate",
-                    f"EXIT_TRAIL: {pair} peak=₹{peak:.0f} now=₹{pnl_inr:.0f} "
-                    f"giveback=₹{giveback:.0f} size={size}",
-                    False,
-                    pair=pair,
-                )
-            if pnl_pct >= self.take_profit_pct:
-                self._last_signal = now
-                self._peak_pnl_inr = 0.0
-                return HedgeSignal(
-                    now, 0.0, size, -size, "immediate",
-                    f"EXIT_TP: {pair} +{pnl_pct:.2%} ~₹{pnl_inr:.0f} size={size}", False,
-                    pair=pair,
-                )
-            if pnl_pct <= -self.stop_loss_pct:
-                self._last_signal = now
-                self._peak_pnl_inr = 0.0
-                return HedgeSignal(
-                    now, 0.0, size, -size, "immediate",
-                    f"EXIT_SL: {pair} {pnl_pct:.2%} ~₹{pnl_inr:.0f} size={size}", False,
-                    pair=pair,
-                )
-            if held >= self.max_hold_sec:
-                self._last_signal = now
-                self._peak_pnl_inr = 0.0
-                return HedgeSignal(
-                    now, 0.0, size, -size, "passive",
-                    f"EXIT_TIMEOUT: {pair} held={held:.0f}s ~₹{pnl_inr:.0f} size={size}", False,
-                    pair=pair,
+                    now, 0.0, -size, size, "immediate",
+                    f"EXIT_FLATTEN_SHORT: {pair} size={size}", False, pair=pair,
                 )
             return None
-        if side == "sell":
-            self._last_signal = now
-            self._peak_pnl_inr = 0.0
-            return HedgeSignal(
-                now, 0.0, -size, size, "immediate",
-                f"EXIT_FLATTEN_SHORT: {pair} size={size}", False,
-                pair=pair,
+
+        # Ensure plan exists (e.g. after restart with open position)
+        if self._tp_price <= 0 or self._sl_price <= 0 or self._plan_pair != pair:
+            self.arm_trade(pair, entry, size)
+
+        if self._entry_ts <= 0:
+            self._entry_ts = now
+
+        pnl = self.pnl_inr(entry, spot, size)
+        # Prefer exchange-reported uPnL if present (often USDT); convert if huge vs our est
+        if position.unrealized_pnl:
+            exch = float(position.unrealized_pnl)
+            # Heuristic: values with |exch| similar to INR already; else treat as USDT
+            if abs(exch) > abs(pnl) * 3 and abs(exch) > 20:
+                pnl = exch  # already INR-like
+            elif abs(exch) * self.usdt_inr > abs(pnl) * 0.5:
+                pnl = exch * self.usdt_inr
+
+        self._peak_pnl_inr = max(self._peak_pnl_inr, pnl)
+        self._peak_price = max(self._peak_price, spot)
+        giveback = self._peak_pnl_inr - pnl
+        # Price trail equivalent to ₹50 giveback
+        price_giveback_usdt = self.trail_giveback_inr / max(size * self.usdt_inr, 1e-9)
+        price_drop = self._peak_price - spot
+        held = now - self._entry_ts
+
+        if now - self._last_hold_log > 8:
+            self._last_hold_log = now
+            print(
+                f"[HOLD] {pair} spot={spot:.4f} pnl=₹{pnl:.0f} peak=₹{self._peak_pnl_inr:.0f} "
+                f"giveback=₹{giveback:.0f} TP={self._tp_price:.4f} SL={self._sl_price:.4f}"
             )
+
+        def _exit(reason: str) -> HedgeSignal:
+            self._last_signal = now
+            self.clear_trade()
+            return HedgeSignal(
+                now, 0.0, size, -size, "immediate", reason, False, pair=pair,
+            )
+
+        # 1) Locked TP price
+        if spot >= self._tp_price:
+            return _exit(
+                f"EXIT_TP: {pair} spot={spot:.4f}>=TP={self._tp_price:.4f} pnl=₹{pnl:.0f}"
+            )
+        # 2) Locked SL price
+        if spot <= self._sl_price:
+            return _exit(
+                f"EXIT_SL: {pair} spot={spot:.4f}<=SL={self._sl_price:.4f} pnl=₹{pnl:.0f}"
+            )
+        # 3) Hard INR loss cap (anti-liquidation)
+        if pnl <= -abs(self.max_loss_inr):
+            return _exit(
+                f"EXIT_MAXLOSS: {pair} pnl=₹{pnl:.0f} <= -₹{self.max_loss_inr:.0f}"
+            )
+        # 4) Trail giveback ₹50 after arming
+        trail_hit = (
+            self._peak_pnl_inr >= self.trail_arm_inr
+            and (
+                giveback >= self.trail_giveback_inr
+                or price_drop >= price_giveback_usdt
+            )
+        )
+        if trail_hit:
+            return _exit(
+                f"EXIT_TRAIL: {pair} peak=₹{self._peak_pnl_inr:.0f} now=₹{pnl:.0f} "
+                f"giveback=₹{giveback:.0f} price_drop={price_drop:.4f}"
+            )
+        # 5) % fallback (in case plan prices drifted)
+        pnl_pct = (spot - entry) / entry
+        if pnl_pct >= self.take_profit_pct:
+            return _exit(f"EXIT_TP_PCT: {pair} +{pnl_pct:.2%} pnl=₹{pnl:.0f}")
+        if pnl_pct <= -self.stop_loss_pct:
+            return _exit(f"EXIT_SL_PCT: {pair} {pnl_pct:.2%} pnl=₹{pnl:.0f}")
+        if held >= self.max_hold_sec:
+            return _exit(f"EXIT_TIMEOUT: {pair} held={held:.0f}s pnl=₹{pnl:.0f}")
         return None
 
     def evaluate(
@@ -734,12 +828,10 @@ class FuturesCycleStrategist:
         min_qty: float,
         pair: Optional[str] = None,
     ) -> Optional[HedgeSignal]:
-        """Backward-compatible single-pair path."""
         pair = pair or CFG["trading"]["perp_symbol"]
         if position and position.size > 0:
             return self.evaluate_exit(spot, position, pair)
-        self._entry_ts = 0.0
-        self._peak_pnl_inr = 0.0
+        self.clear_trade()
         return self.pick_entry({pair: spot}, {pair: min_qty})
 
 
@@ -892,6 +984,22 @@ class DataStore:
         except Exception:
             pass
 
+    async def save_trade_plan(self, plan: Dict):
+        try:
+            if plan and plan.get("pair"):
+                await self.rd.set("rubaih:trade_plan", json.dumps(plan))
+            else:
+                await self.rd.delete("rubaih:trade_plan")
+        except Exception:
+            pass
+
+    async def load_trade_plan(self) -> Dict:
+        try:
+            raw = await self.rd.get("rubaih:trade_plan")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
     async def save_hedge(self, signal: HedgeSignal, price: float, size: Optional[float] = None):
         side = "buy" if signal.hedge_size > 0 else "sell"
         qty = abs(size if size is not None else signal.hedge_size)
@@ -994,9 +1102,11 @@ class RubaihBot:
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 5000)),
-            "target_margin_inr": str(cfg.get("target_margin_inr", 2000)),
+            "target_margin_inr": str(cfg.get("target_margin_inr", 1200)),
+            "max_margin_inr": str(cfg.get("max_margin_inr", 1500)),
             "profit_trail_giveback_inr": str((cfg.get("strategy") or {}).get("profit_trail_giveback_inr", 50)),
-            "profit_trail_arm_inr": str((cfg.get("strategy") or {}).get("profit_trail_arm_inr", 80)),
+            "profit_trail_arm_inr": str((cfg.get("strategy") or {}).get("profit_trail_arm_inr", 100)),
+            "max_loss_inr": str((cfg.get("strategy") or {}).get("max_loss_inr", 200)),
             "leverage": str(cfg.get("leverage", 10)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
@@ -1007,7 +1117,7 @@ class RubaihBot:
             "scan_pairs": ",".join(self._scan_pairs),
         }
         force_keys = (
-            "mode", "capital_inr", "target_margin_inr", "leverage",
+            "mode", "capital_inr", "target_margin_inr", "max_margin_inr", "leverage",
             "perp_symbol", "margin_currency", "live_trading", "max_delta",
         )
         existing = await self.store.rd.hgetall("rubaih:settings")
@@ -1023,15 +1133,26 @@ class RubaihBot:
                 self.cycle.capital_inr = float(defaults["capital_inr"])
             elif k == "target_margin_inr":
                 self.cycle.target_margin_inr = float(defaults["target_margin_inr"])
+            elif k == "max_margin_inr":
+                self.cycle.max_margin_inr = float(defaults["max_margin_inr"])
             elif k == "mode":
                 self._mode = str(defaults["mode"]).strip().lower()
             elif k == "max_delta":
                 self.risk.max_delta = float(defaults["max_delta"])
         self.cycle.margin_buffer = float(cfg.get("margin_buffer", 0.85))
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
+        scfg = cfg.get("strategy") or {}
+        self.cycle.max_loss_inr = float(scfg.get("max_loss_inr", 200))
+        self.cycle.trail_giveback_inr = float(scfg.get("profit_trail_giveback_inr", 50))
+        self.cycle.trail_arm_inr = float(scfg.get("profit_trail_arm_inr", 100))
+        self.cycle.take_profit_pct = float(scfg.get("take_profit_pct", 0.004))
+        self.cycle.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.0025))
         print(
             f"[SETTINGS] Forced from config: mode={self._mode} capital=₹{self.cycle.capital_inr} "
-            f"target_margin=₹{self.cycle.target_margin_inr} lev={self._leverage}x"
+            f"target_margin=₹{self.cycle.target_margin_inr} max_margin=₹{self.cycle.max_margin_inr} "
+            f"TP={self.cycle.take_profit_pct:.2%} SL={self.cycle.stop_loss_pct:.2%} "
+            f"trail=₹{self.cycle.trail_giveback_inr}/arm₹{self.cycle.trail_arm_inr} "
+            f"max_loss=₹{self.cycle.max_loss_inr} lev={self._leverage}x"
         )
 
     async def _set_active_pair(self, pair: str):
@@ -1233,6 +1354,11 @@ class RubaihBot:
             mapping={"scan_pairs": ",".join(self._scan_pairs), "active_pair": self._active_pair},
         )
         await self.store.set_engine_status("running" if self._live else "dry_run")
+        # Restore open-trade TP/SL plan after restart
+        plan = await self.store.load_trade_plan()
+        if plan:
+            self.cycle.restore_trade_plan(plan)
+            print(f"[RUBAIH] Restored trade plan: {plan}")
 
     async def ws_listener(self):
         """CoinDCX public socket.io orderbook for the active pair (reconnects on pair switch)."""
@@ -1515,6 +1641,21 @@ class RubaihBot:
                     # Mirror into cycle tracker so exits/dashboard stay consistent
                     if self._mode == "futures_cycle":
                         self._dry_pos = positions[0]
+                        if self.cycle._tp_price <= 0 or self.cycle._plan_pair != positions[0].symbol:
+                            self.cycle.arm_trade(
+                                positions[0].symbol,
+                                positions[0].entry_price,
+                                positions[0].size,
+                            )
+                            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                            await self._log(
+                                f"[SYNC] Armed TP/SL for open {positions[0].symbol} "
+                                f"entry={positions[0].entry_price}"
+                            )
+                else:
+                    if self._mode == "futures_cycle" and not self._dry_pos:
+                        self.cycle.clear_trade()
+                        await self.store.save_trade_plan({})
                 self.portfolio.update_positions(positions)
             except Exception as e:
                 print(f"[SYNC] Error: {e}")
@@ -1606,9 +1747,13 @@ class RubaihBot:
                         exit_spot = self._mid_for(pos_pair)
                         if exit_spot > 0:
                             signal = self.cycle.evaluate_exit(exit_spot, pos, pos_pair)
+                            # Persist peak while holding
+                            try:
+                                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                            except Exception:
+                                pass
                     else:
-                        self.cycle._entry_ts = 0.0
-                        self.cycle._peak_pnl_inr = 0.0
+                        self.cycle.clear_trade()
                         mids = {
                             p: self._pair_mids[p]
                             for p in self._scan_pairs
@@ -1627,8 +1772,14 @@ class RubaihBot:
                         if signal.pair:
                             await self._set_active_pair(signal.pair)
                         await self._log(f"[CYCLE] {signal.reason}")
-                        await self._execute_hedge(signal)
+                        # Exits must never be rate-limited or soft-blocked
+                        is_exit = signal.hedge_size < 0
+                        await self._execute_hedge(signal, force=is_exit)
                         await self._publish_snapshot()
+                        if is_exit:
+                            await self.store.save_trade_plan({})
+                        else:
+                            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
                 else:
                     signal = self.strategist.evaluate(greeks, spot if spot > 0 else next(iter(self._pair_mids.values()), 0.0))
                     if signal and signal.hedge_size != 0:
@@ -1711,7 +1862,6 @@ class RubaihBot:
         """Update local cycle position (dry-run and live) so dashboard reflects fills."""
         if self._mode != "futures_cycle" or qty <= 0:
             return
-        # Ensure product exists so compute_greeks can see the position
         if symbol not in self.products:
             base = symbol.replace("B-", "").replace("I-", "").split("_")[0]
             prod = CoinDCXProduct(pair=symbol, symbol=symbol, underlying=base, is_perp=True)
@@ -1732,23 +1882,25 @@ class RubaihBot:
                     symbol=symbol, product_id=f"dry-{symbol}", side="buy",
                     size=qty, entry_price=price, unrealized_pnl=0.0,
                 )
+            # Lock TP/SL immediately at fill price
+            if self._dry_pos:
+                self.cycle.arm_trade(symbol, self._dry_pos.entry_price, self._dry_pos.size)
         else:  # SELL
             if pos and pos.side == "buy":
                 remain = pos.size - qty
                 if remain <= 1e-12:
                     self._dry_pos = None
-                    self.cycle._entry_ts = 0.0
-                    self.cycle._peak_pnl_inr = 0.0
+                    self.cycle.clear_trade()
                 else:
                     pos.size = remain
             else:
                 self._dry_pos = None
-                self.cycle._peak_pnl_inr = 0.0
+                self.cycle.clear_trade()
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
         else:
             self.portfolio.update_positions([])
-            self.cycle._peak_pnl_inr = 0.0
+            self.cycle.clear_trade()
 
     async def _emergency_unwind(self):
         print("[EMERGENCY] Flattening...")

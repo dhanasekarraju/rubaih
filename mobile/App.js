@@ -403,8 +403,9 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>How exits work</Text>
               <Text style={styles.help}>
-                Buys best momentum coin (~₹{settings?.target_margin_inr || 2000} margin).{"\n"}
-                Sells on take-profit, stop-loss, or if profit peaks then drops ₹{settings?.profit_trail_giveback_inr || 50} (trail lock).
+                At buy: locks TP (+0.4%) and SL (−0.25%) prices.{"\n"}
+                Also sells if loss hits ₹{settings?.max_loss_inr || 200}, or profit peaks then drops ₹{settings?.profit_trail_giveback_inr || 50}.{"\n"}
+                Margin per trade capped ~₹{settings?.max_margin_inr || 1500} (target ₹{settings?.target_margin_inr || 1200}).
               </Text>
             </View>
           </>

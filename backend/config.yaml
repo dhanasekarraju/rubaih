@@ -8,27 +8,23 @@ exchange:
   public_url: "https://public.coindcx.com"
   ws_url: "https://stream.coindcx.com"
 
-  # INR-margined futures (prices still quoted in USDT)
   margin_currency: "INR"
-
   maker_fee: 0.00025
   taker_fee: 0.00075
 
 trading:
   underlying: "BTC"
-  perp_symbol: "B-BTC_USDT"   # default / fallback when flat
-
-  # flat → scan → buy → sell cycle
+  perp_symbol: "B-BTC_USDT"
   mode: futures_cycle
 
-  # Account sizing — ₹5000 INR margin wallet; each trade aims ~₹2000 margin
+  # Keep each trade small — never eat most of the wallet on one coin
   capital_inr: 5000
-  target_margin_inr: 2000
+  target_margin_inr: 1200
+  max_margin_inr: 1500
   leverage: 10
   usdt_inr: 87
   margin_buffer: 0.85
 
-  # Multi-pair scanner
   scan_enabled: true
   scan_pairs:
     - B-BTC_USDT
@@ -38,15 +34,12 @@ trading:
   scan_interval_sec: 5
 
   delta_threshold: 0.0005
-  # Position size is coin units (ETH can be 0.05+) — do not treat like options delta
   max_delta: 100.0
   max_vega: 100.0
   max_drawdown_pct: 0.15
 
   min_hedge_interval_sec: 45
   cost_buffer_multiplier: 1.2
-
-  # Cap per order in coin units (high enough for ETH/SOL lots)
   max_order_size_btc: 2.0
   twap_slices: 1
   twap_interval_sec: 5
@@ -55,22 +48,23 @@ trading:
     entry_cooldown_sec: 90
     momentum_lookback: 24
     entry_move_pct: 0.0012
-    # Round-trip taker ~0.15%; TP must clear fees with room
-    take_profit_pct: 0.005
-    stop_loss_pct: 0.0035
-    max_hold_sec: 1800
+    # Locked at buy as absolute prices (also % checks)
+    take_profit_pct: 0.004
+    stop_loss_pct: 0.0025
+    # Hard INR stop — sell if loss reaches this (before liquidation)
+    max_loss_inr: 200
+    max_hold_sec: 1200
     allow_short: false
-    # Lock profit: after any peak unrealized PnL, sell if it gives back this much (INR)
+    # Trail: arm after ₹100 peak profit; sell if giveback ≥ ₹50
     profit_trail_giveback_inr: 50
-    # Start trailing only after peak unrealized PnL reaches this (INR)
-    profit_trail_arm_inr: 80
+    profit_trail_arm_inr: 100
 
 risk:
   kill_switch_on_drawdown: true
   kill_switch_on_delta_limit: true
   kill_switch_on_vega_limit: true
   emergency_flatten: true
-  rate_limit_orders_per_sec: 3
+  rate_limit_orders_per_sec: 5
 
 api:
   host: "0.0.0.0"
