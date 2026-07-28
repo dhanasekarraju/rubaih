@@ -213,31 +213,50 @@ class CoinDCXClient:
             return data if isinstance(data, dict) else {}
 
     async def verify_credentials(self) -> bool:
-        """Probe /users/info with ms then seconds timestamp. Sets _auth_ok / _ts_mode."""
+        """
+        Probe auth. Prefer futures endpoints (what CoinDCX enables after approval email),
+        then fall back to /users/info. Tries timestamp ms then seconds.
+        """
         for mode in ("ms", "s"):
             self._ts_mode = mode
-            data = await self._signed_post("/exchange/v1/users/info", {})
-            # success: dict with coindcx_id / email / first_name etc, not error status
-            if isinstance(data, dict) and data.get("status") != "error" and data.get("code") not in (401, "401"):
-                if data.get("coindcx_id") or data.get("email") or data.get("id") or "first_name" in data:
+
+            # 1) Futures positions — documented under Futures End Points
+            pos = await self._signed_post(
+                "/exchange/v1/derivatives/futures/positions",
+                {
+                    "page": "1",
+                    "size": "10",
+                    "margin_currency_short_name": [self.margin],
+                },
+            )
+            if isinstance(pos, list):
+                self._auth_ok = True
+                print(f"[AUTH] CoinDCX futures OK (timestamp={mode}, margin={self.margin})")
+                return True
+            if isinstance(pos, dict) and pos.get("status") != "error" and pos.get("code") not in (401, "401"):
+                # some wrappers return {data: [...]}
+                if "data" in pos or "result" in pos or pos:
                     self._auth_ok = True
-                    print(f"[AUTH] CoinDCX OK (timestamp={mode}): id={data.get('coindcx_id') or data.get('id') or 'ok'}")
+                    print(f"[AUTH] CoinDCX futures OK (timestamp={mode}): keys={list(pos.keys())[:6]}")
                     return True
-                # Some responses are nested
-                if data and "message" not in data:
+            print(f"[AUTH] futures/positions failed timestamp={mode}: {pos}")
+
+            # 2) Spot-style users/info (optional secondary check)
+            info = await self._signed_post("/exchange/v1/users/info", {})
+            if isinstance(info, dict) and info.get("status") != "error" and info.get("code") not in (401, "401"):
+                if info.get("coindcx_id") or info.get("email") or info.get("id") or "first_name" in info:
                     self._auth_ok = True
-                    print(f"[AUTH] CoinDCX OK (timestamp={mode}): keys={list(data.keys())[:5]}")
+                    print(f"[AUTH] CoinDCX users/info OK (timestamp={mode})")
                     return True
-            print(f"[AUTH] users/info failed with timestamp={mode}: {data}")
+            print(f"[AUTH] users/info failed timestamp={mode}: {info}")
+
         self._auth_ok = False
         self._ts_mode = "ms"
         print(
-            "[AUTH] FAILED — CoinDCX Invalid credentials.\n"
-            "  1) New key must be email-confirmed\n"
-            "  2) Whitelist this VPS public IP exactly\n"
-            "  3) Paste secret shown only once at create (no spaces)\n"
-            "  4) docker compose up -d --force-recreate rubaih_engine\n"
-            "  Dry-run cycle can still run; LIVE orders blocked until auth works."
+            "[AUTH] FAILED — CoinDCX Invalid credentials on futures endpoints.\n"
+            "  Docs: https://docs.coindcx.com/#futures-end-points\n"
+            "  After CoinDCX approval email: recreate key if needed, confirm IP whitelist,\n"
+            "  then: docker compose up -d --force-recreate rubaih_engine"
         )
         return False
 
