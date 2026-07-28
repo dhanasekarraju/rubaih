@@ -763,15 +763,24 @@ class DataStore:
             );
         """)
 
-    async def save_greeks(self, g: GreeksSnapshot, spot: float, session_pnl: float = 0.0):
+    async def save_greeks(
+        self,
+        g: GreeksSnapshot,
+        spot: float,
+        session_pnl: float = 0.0,
+        active_pair: Optional[str] = None,
+    ):
         await self.pg.execute(
             "INSERT INTO greeks_snapshots (delta, gamma, vega, theta, spot_price) VALUES ($1,$2,$3,$4,$5)",
             g.delta, g.gamma, g.vega, g.theta, spot
         )
         await self.rd.set("rubaih:session_pnl", str(session_pnl))
+        pair = active_pair or CFG["trading"]["perp_symbol"]
+        await self.rd.set("rubaih:active_pair", pair)
         await self.rd.publish("rubaih:greeks", json.dumps({
             "timestamp": g.timestamp, "delta": g.delta, "gamma": g.gamma,
-            "vega": g.vega, "theta": g.theta, "spot": spot, "session_pnl": session_pnl
+            "vega": g.vega, "theta": g.theta, "spot": spot, "session_pnl": session_pnl,
+            "active_pair": pair,
         }))
 
     async def set_engine_status(self, status: str):
@@ -888,7 +897,8 @@ class RubaihBot:
             return
         self._active_pair = pair
         try:
-            await self.store.rd.hset("rubaih:settings", mapping={"active_pair": pair, "perp_symbol": pair})
+            # Keep config default in perp_symbol; active_pair is the live focus
+            await self.store.rd.hset("rubaih:settings", mapping={"active_pair": pair})
             await self.store.rd.set("rubaih:active_pair", pair)
         except Exception:
             pass
@@ -1025,11 +1035,17 @@ class RubaihBot:
             try:
                 details = await self.client.get_instrument(pair)
                 inst = details.get("instrument", details) if isinstance(details, dict) else {}
-                underlying = (
+                # Base from pair id (B-ETH_USDT → ETH). Do NOT use position/margin
+                # currency (often INR/USDT) — that made every coin look like BTC/INR.
+                base = pair.replace("B-", "").replace("I-", "").split("_")[0].upper()
+                raw_u = (
                     inst.get("underlying_currency_short_name")
-                    or inst.get("position_currency_short_name")
-                    or pair.replace("B-", "").replace("I-", "").split("_")[0]
+                    or inst.get("underlying")
+                    or base
                 )
+                underlying = str(raw_u).upper().strip()
+                if underlying in ("INR", "USDT", "USD", "USD-M", "INR-M", ""):
+                    underlying = base
                 prod = CoinDCXProduct(
                     pair=pair,
                     symbol=pair,
@@ -1361,7 +1377,7 @@ class RubaihBot:
                     spot = next(iter(self._pair_mids.values()), 0.0)
 
                 session_pnl = sum(p.unrealized_pnl for p in self.portfolio.positions.values())
-                await self.store.save_greeks(greeks, spot, session_pnl)
+                await self.store.save_greeks(greeks, spot, session_pnl, active_pair=self._active_pair)
 
                 violation = self.risk.check(greeks, session_pnl)
                 if violation:

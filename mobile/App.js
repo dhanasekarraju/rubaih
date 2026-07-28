@@ -158,6 +158,7 @@ export default function App() {
             theta: msg.data.theta,
             spot_price: msg.data.spot,
             session_pnl: msg.data.session_pnl ?? prev?.session_pnl,
+            active_pair: msg.data.active_pair || prev?.active_pair,
             timestamp: new Date(msg.data.timestamp * 1000).toISOString(),
             status: prev?.status || 'running',
           }));
@@ -305,7 +306,7 @@ export default function App() {
   };
 
   const activePair = dashboard?.active_pair || settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT';
-  const pairBase = String(activePair).replace(/^B-/, '').replace(/^I-/, '').split('_')[0] || 'BTC';
+  const pairBase = String(activePair).replace(/^B-/i, '').replace(/^I-/i, '').split('_')[0] || 'BTC';
   const pairUnit = ` ${pairBase}`;
 
   const fmtSetting = (v, suffix = '') => {
@@ -380,7 +381,8 @@ export default function App() {
 
               {dashboard && (
                 <View style={styles.heroCard}>
-                  <Text style={styles.heroLabel}>Mark (USDT) · {activePair}</Text>
+                  <Text style={styles.heroLabel}>{pairBase} Mark (USDT)</Text>
+                  <Text style={styles.heroPair}>{activePair}</Text>
                   <Text style={styles.heroPrice}>{formatUsdt(dashboard.spot_price)}</Text>
                   <Text style={styles.pnlLine}>Session PnL: {formatInr(dashboard.session_pnl)}</Text>
                   <View style={styles.heroRow}>
@@ -702,6 +704,7 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: COLORS.gold + '33', alignItems: 'center',
   },
   heroLabel: { fontSize: 12, color: COLORS.textSecondary, textTransform: 'uppercase', letterSpacing: 2 },
+  heroPair: { fontSize: 11, color: COLORS.textMuted, marginTop: 4, letterSpacing: 0.5 },
   heroPrice: { fontSize: 36, fontWeight: 'bold', color: COLORS.gold, marginVertical: 8, fontVariant: ['tabular-nums'] },
   pnlLine: { fontSize: 13, color: COLORS.textSecondary, marginBottom: 8, fontVariant: ['tabular-nums'] },
   heroRow: { flexDirection: 'row', gap: 8, marginTop: 4, flexWrap: 'wrap', justifyContent: 'center' },

@@ -311,8 +311,15 @@ async def get_settings():
             "scan_pairs": "B-BTC_USDT,B-ETH_USDT,B-SOL_USDT",
         }
     # Keep non-float metadata as strings in response
+    string_keys = {
+        "mode", "exchange", "margin_currency", "perp_symbol", "active_pair",
+        "scan_pairs", "scan_enabled", "live_trading",
+    }
     out = {}
     for k, v in settings.items():
+        if k in string_keys:
+            out[k] = v
+            continue
         try:
             out[k] = float(v)
         except (TypeError, ValueError):
