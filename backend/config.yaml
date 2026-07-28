@@ -1,13 +1,11 @@
-# Rubaih Configuration — CoinDCX INR-M Futures Cycle Bot
-# Multi-pair scanner sized for ~₹5000 free futures margin.
-# Ignores locked books (e.g. SLX). Live only when LIVE_TRADING=true.
+# Rubaih — CoinDCX INR-M futures cycle
+# Sizing & risk are FRACTIONS of free capital / trade margin — not fixed ₹ amounts.
 
 exchange:
   name: "coindcx"
   rest_url: "https://api.coindcx.com"
   public_url: "https://public.coindcx.com"
   ws_url: "https://stream.coindcx.com"
-
   margin_currency: "INR"
   maker_fee: 0.00025
   taker_fee: 0.00075
@@ -17,13 +15,14 @@ trading:
   perp_symbol: "B-BTC_USDT"
   mode: futures_cycle
 
-  # Keep each trade small — never eat most of the wallet on one coin
+  # Fallback estimate only — live free margin from CoinDCX preferred
   capital_inr: 5000
-  target_margin_inr: 1200
-  max_margin_inr: 1500
   leverage: 10
   usdt_inr: 87
-  margin_buffer: 0.85
+
+  # Use 50–60% of *available* futures capital per trade
+  margin_use_frac: 0.55
+  margin_use_max_frac: 0.60
 
   scan_enabled: true
   scan_pairs:
@@ -45,19 +44,19 @@ trading:
   twap_interval_sec: 5
 
   strategy:
-    entry_cooldown_sec: 90
+    entry_cooldown_sec: 75
     momentum_lookback: 24
-    entry_move_pct: 0.0012
-    # Locked at buy as absolute prices (also % checks)
-    take_profit_pct: 0.004
-    stop_loss_pct: 0.0025
-    # Hard INR stop — sell if loss reaches this (before liquidation)
-    max_loss_inr: 200
+    entry_move_pct: 0.001
+    # Locked prices at buy (1R = stop distance)
+    take_profit_pct: 0.006      # ~2R if SL is 0.3%
+    stop_loss_pct: 0.003
     max_hold_sec: 1200
     allow_short: false
-    # Trail: arm after ₹100 peak profit; sell if giveback ≥ ₹50
-    profit_trail_giveback_inr: 50
-    profit_trail_arm_inr: 100
+    # Risk vs THIS trade's margin (dynamic with capital)
+    max_loss_frac: 0.10          # cut if loss ≥ 10% of margin used
+    trail_arm_r: 1.0             # arm trail after +1R profit
+    trail_giveback_r: 0.5        # sell if give back 0.5R from peak (price or ₹)
+    trail_giveback_of_peak: 0.20 # or give back 20% of peak unrealized ₹
 
 risk:
   kill_switch_on_drawdown: true

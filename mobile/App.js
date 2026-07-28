@@ -403,9 +403,11 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>How exits work</Text>
               <Text style={styles.help}>
-                At buy: locks TP (+0.4%) and SL (−0.25%) prices.{"\n"}
-                Also sells if loss hits ₹{settings?.max_loss_inr || 200}, or profit peaks then drops ₹{settings?.profit_trail_giveback_inr || 50}.{"\n"}
-                Margin per trade capped ~₹{settings?.max_margin_inr || 1500} (target ₹{settings?.target_margin_inr || 1200}).
+                {`Size: ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free futures capital (live balance, not a fixed ₹).`}
+                {"\n"}
+                {`At buy: locks TP (+${(((settings?.take_profit_pct ?? 0.006) * 100).toFixed(2))}%) and SL (−${(((settings?.stop_loss_pct ?? 0.003) * 100).toFixed(2))}%).`}
+                {"\n"}
+                {`Trail arms after +${settings?.trail_arm_r ?? 1}R, sells on ~${settings?.trail_giveback_r ?? 0.5}R giveback. Hard cut at ${Math.round((settings?.max_loss_frac ?? 0.10) * 100)}% of that trade's margin.`}
               </Text>
             </View>
           </>
@@ -487,8 +489,9 @@ export default function App() {
             </View>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Bot (from server)</Text>
-              <Row C={C} label="Capital" value={`${settings?.capital_inr ?? '—'} INR`} />
-              <Row C={C} label="Target margin" value={`${settings?.target_margin_inr ?? 2000} INR`} />
+              <Row C={C} label="Free capital" value={`${settings?.free_capital_inr ?? settings?.capital_inr ?? '—'} INR`} />
+              <Row C={C} label="Trade budget" value={`${settings?.trade_budget_inr ?? '—'} INR`} />
+              <Row C={C} label="Margin use" value={`${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}%`} />
               <Row C={C} label="Leverage" value={`${settings?.leverage ?? '—'}x`} />
               <Row C={C} label="Active pair" value={settings?.active_pair || '—'} />
               <Row C={C} label="Live trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
