@@ -121,6 +121,8 @@ class DashboardData(BaseModel):
     live_trading: bool
     exchange: str = "coindcx"
     active_pair: str = "B-BTC_USDT"
+    position_size: float = 0.0
+    position_side: str = "flat"
 
 
 class HedgeTrade(BaseModel):
@@ -200,6 +202,8 @@ async def dashboard():
         or settings.get("perp_symbol")
         or "B-BTC_USDT"
     )
+    position_size = float(await rd_client.get("rubaih:position_size") or 0)
+    position_side = (await rd_client.get("rubaih:position_side") or "flat").lower()
 
     if not row:
         return DashboardData(
@@ -210,15 +214,24 @@ async def dashboard():
             ai_last_action=None, ai_confidence=None,
             live_trading=LIVE_TRADING,
             active_pair=active_pair,
+            position_size=position_size,
+            position_side=position_side,
+        )
+
+    # Futures cycle: prefer redis position over stale/zero greeks delta
+    delta = float(row["delta"])
+    if position_size > 0:
+        delta = position_size if position_side == "long" else (
+            -position_size if position_side == "short" else delta
         )
 
     return DashboardData(
         timestamp=row["timestamp"].isoformat(),
         spot_price=float(row["spot_price"]),
-        delta=float(row["delta"]),
-        gamma=float(row["gamma"]),
-        vega=float(row["vega"]),
-        theta=float(row["theta"]),
+        delta=delta,
+        gamma=0.0,  # N/A for futures
+        vega=0.0,
+        theta=0.0,
         session_pnl=session_pnl,
         num_positions=int(count or 0),
         status=engine_status,
@@ -227,6 +240,8 @@ async def dashboard():
         ai_confidence=float(ai_row["confidence"]) if ai_row else None,
         live_trading=LIVE_TRADING,
         active_pair=active_pair,
+        position_size=position_size,
+        position_side=position_side,
     )
 
 

@@ -150,15 +150,23 @@ export default function App() {
       try {
         const msg = JSON.parse(e.data);
         if (msg.channel === 'rubaih:greeks') {
+          const posSize = msg.data.position_size;
+          const posSide = msg.data.position_side;
+          let delta = msg.data.delta;
+          if (posSize != null && Number(posSize) > 0) {
+            delta = posSide === 'short' ? -Number(posSize) : Number(posSize);
+          }
           setDashboard(prev => ({
             ...(prev || {}),
-            delta: msg.data.delta,
-            gamma: msg.data.gamma,
-            vega: msg.data.vega,
-            theta: msg.data.theta,
+            delta,
+            gamma: 0,
+            vega: 0,
+            theta: 0,
             spot_price: msg.data.spot,
             session_pnl: msg.data.session_pnl ?? prev?.session_pnl,
             active_pair: msg.data.active_pair || prev?.active_pair,
+            position_size: posSize != null ? Number(posSize) : (prev?.position_size ?? 0),
+            position_side: posSide || prev?.position_side || 'flat',
             timestamp: new Date(msg.data.timestamp * 1000).toISOString(),
             status: prev?.status || 'running',
           }));
@@ -412,26 +420,35 @@ export default function App() {
                 <View style={styles.greeksGrid}>
                   <GreekCard
                     label="Position"
-                    value={formatNumber(dashboard.delta, 4)}
+                    value={formatNumber(
+                      dashboard.position_size > 0 ? dashboard.position_size : Math.abs(dashboard.delta || 0),
+                      4
+                    )}
                     unit={pairUnit}
-                    color={Math.abs(dashboard.delta) > 0.0001 ? COLORS.gold : COLORS.green}
+                    color={
+                      (dashboard.position_size > 0 || Math.abs(dashboard.delta) > 0.0001)
+                        ? COLORS.gold
+                        : COLORS.green
+                    }
                     icon="Δ"
                   />
                   <GreekCard
                     label="Side"
                     value={
-                      Math.abs(dashboard.delta || 0) < 0.00005
-                        ? 'FLAT'
-                        : dashboard.delta > 0
-                          ? 'LONG'
-                          : 'SHORT'
+                      dashboard.position_side && dashboard.position_side !== 'flat'
+                        ? dashboard.position_side.toUpperCase()
+                        : Math.abs(dashboard.delta || 0) < 0.00005
+                          ? 'FLAT'
+                          : dashboard.delta > 0
+                            ? 'LONG'
+                            : 'SHORT'
                     }
                     color={
-                      Math.abs(dashboard.delta || 0) < 0.00005
-                        ? COLORS.green
-                        : dashboard.delta > 0
-                          ? COLORS.cyan
-                          : COLORS.red
+                      (dashboard.position_side === 'long' || dashboard.delta > 0.00005)
+                        ? COLORS.cyan
+                        : (dashboard.position_side === 'short' || dashboard.delta < -0.00005)
+                          ? COLORS.red
+                          : COLORS.green
                     }
                     icon="◎"
                   />
@@ -450,13 +467,13 @@ export default function App() {
                 </View>
               )}
 
-              {dashboard && Math.abs(dashboard.delta || 0) < 0.00005 && (
+              {dashboard && (dashboard.position_size > 0 || Math.abs(dashboard.delta || 0) >= 0.00005) ? null : (
                 <View style={styles.infoCard}>
                   <Text style={styles.infoTitle}>Why Position is 0</Text>
                   <Text style={styles.infoBody}>
-                    You are flat (no open futures on {activePair}). Delta = position size.{"\n"}
+                    You are flat (no open futures on {activePair}).{"\n"}
                     Scanner picks the best momentum pair when flat.{"\n"}
-                    After a buy, Position shows the long size for that pair.
+                    After a buy, Position / Side update here (Gamma/Vega/Theta are N/A for futures).
                   </Text>
                 </View>
               )}

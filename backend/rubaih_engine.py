@@ -769,6 +769,8 @@ class DataStore:
         spot: float,
         session_pnl: float = 0.0,
         active_pair: Optional[str] = None,
+        position_size: float = 0.0,
+        position_side: str = "flat",
     ):
         await self.pg.execute(
             "INSERT INTO greeks_snapshots (delta, gamma, vega, theta, spot_price) VALUES ($1,$2,$3,$4,$5)",
@@ -777,21 +779,26 @@ class DataStore:
         await self.rd.set("rubaih:session_pnl", str(session_pnl))
         pair = active_pair or CFG["trading"]["perp_symbol"]
         await self.rd.set("rubaih:active_pair", pair)
+        await self.rd.set("rubaih:position_size", str(position_size))
+        await self.rd.set("rubaih:position_side", position_side)
         await self.rd.publish("rubaih:greeks", json.dumps({
             "timestamp": g.timestamp, "delta": g.delta, "gamma": g.gamma,
             "vega": g.vega, "theta": g.theta, "spot": spot, "session_pnl": session_pnl,
             "active_pair": pair,
+            "position_size": position_size,
+            "position_side": position_side,
         }))
 
     async def set_engine_status(self, status: str):
         await self.rd.set("rubaih:engine_status", status)
         await self.rd.publish("rubaih:status", json.dumps({"status": status, "ts": time.time()}))
 
-    async def save_hedge(self, signal: HedgeSignal, price: float):
+    async def save_hedge(self, signal: HedgeSignal, price: float, size: Optional[float] = None):
         side = "buy" if signal.hedge_size > 0 else "sell"
+        qty = abs(size if size is not None else signal.hedge_size)
         await self.pg.execute(
             "INSERT INTO hedge_trades (symbol, side, size, price, reason, ai_augmented) VALUES ($1,$2,$3,$4,$5,$6)",
-            signal.pair or CFG["trading"]["perp_symbol"], side, abs(signal.hedge_size), price, signal.reason, signal.ai_augmented
+            signal.pair or CFG["trading"]["perp_symbol"], side, qty, price, signal.reason, signal.ai_augmented
         )
 
     async def save_risk_event(self, event_type: str, details: str):
@@ -1243,14 +1250,61 @@ class RubaihBot:
                 return pos, pair
         return None, None
 
+    def _position_meta(self) -> Tuple[float, str, Optional[str]]:
+        """Return (size, side, pair) for dashboard — cycle local pos preferred."""
+        pos, pair = self._find_open_position()
+        if pos and pos.size > 0:
+            side = (pos.side or "buy").lower()
+            if side in ("buy", "long"):
+                side = "long"
+            elif side in ("sell", "short"):
+                side = "short"
+            else:
+                side = "flat"
+            return float(pos.size), side, pair or pos.symbol
+        return 0.0, "flat", self._active_pair
+
+    async def _publish_snapshot(self):
+        """Push greeks + position so dashboard updates right after fills."""
+        greeks = self.portfolio.compute_greeks()
+        size, side, pair = self._position_meta()
+        # Futures: delta == signed position size (gamma/vega/theta stay 0)
+        if self._mode == "futures_cycle" and size > 0:
+            signed = size if side == "long" else -size
+            greeks = GreeksSnapshot(
+                timestamp=time.time(),
+                delta=signed,
+                gamma=0.0,
+                vega=0.0,
+                theta=0.0,
+            )
+        spot = self._mid_for(pair or self._active_pair)
+        if spot <= 0 and self._pair_mids:
+            spot = next(iter(self._pair_mids.values()), 0.0)
+        session_pnl = sum(p.unrealized_pnl for p in self.portfolio.positions.values())
+        if self._dry_pos and spot > 0 and self._dry_pos.entry_price > 0:
+            direction = 1.0 if (self._dry_pos.side or "buy").lower() == "buy" else -1.0
+            self._dry_pos.unrealized_pnl = (
+                (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
+            )
+            session_pnl = self._dry_pos.unrealized_pnl
+        await self.store.save_greeks(
+            greeks,
+            spot,
+            session_pnl,
+            active_pair=pair or self._active_pair,
+            position_size=size,
+            position_side=side,
+        )
+
     async def sync_positions(self):
         """Sync positions for scan allowlist only — never ingest SLX / other books."""
         while self._running:
             try:
                 allow = set(self._scan_pairs) | {self._active_pair}
 
-                # Dry-run cycle: keep simulated position; refresh mark/PnL only
-                if not self._live and self._mode == "futures_cycle" and self._dry_pos:
+                # futures_cycle: local cycle position is source of truth for dashboard
+                if self._mode == "futures_cycle" and self._dry_pos and self._dry_pos.size > 0:
                     spot = self._mid_for(self._dry_pos.symbol)
                     if spot > 0 and self._dry_pos.entry_price > 0:
                         direction = 1.0 if self._dry_pos.side == "buy" else -1.0
@@ -1258,30 +1312,35 @@ class RubaihBot:
                             (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
                         )
                     self.portfolio.update_positions([self._dry_pos])
+                    await self._set_active_pair(self._dry_pos.symbol)
+                    # Live: optionally overlay exchange marks, but never wipe local while open
+                    if self._live and self.client and self.client._auth_ok:
+                        try:
+                            raw = await self.client.get_positions() or []
+                            for rp in raw:
+                                pair = rp.get("pair", "")
+                                if pair != self._dry_pos.symbol:
+                                    continue
+                                active = float(rp.get("active_pos", 0) or 0)
+                                mark = float(rp.get("mark_price", 0) or 0)
+                                avg = float(rp.get("avg_price", 0) or 0)
+                                if abs(active) > 0:
+                                    self._dry_pos.size = abs(active)
+                                    self._dry_pos.side = "buy" if active > 0 else "sell"
+                                    if avg > 0:
+                                        self._dry_pos.entry_price = avg
+                                    if mark > 0 and avg > 0:
+                                        self._dry_pos.unrealized_pnl = (mark - avg) * active
+                                    self.portfolio.update_positions([self._dry_pos])
+                                break
+                        except Exception as e:
+                            print(f"[SYNC] live overlay: {e}")
                     await asyncio.sleep(10)
                     continue
 
-                # Also keep simulated pos when LIVE but CoinDCX auth is down
-                if (
-                    self._live
-                    and self.client
-                    and not self.client._auth_ok
-                    and self._mode == "futures_cycle"
-                    and self._dry_pos
-                ):
-                    spot = self._mid_for(self._dry_pos.symbol)
-                    if spot > 0 and self._dry_pos.entry_price > 0:
-                        direction = 1.0 if self._dry_pos.side == "buy" else -1.0
-                        self._dry_pos.unrealized_pnl = (
-                            (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
-                        )
-                    self.portfolio.update_positions([self._dry_pos])
-                    await asyncio.sleep(10)
-                    continue
-
-                raw = await self.client.get_positions()
+                raw = await self.client.get_positions() if self.client else []
                 positions = []
-                for rp in raw:
+                for rp in (raw or []):
                     pair = rp.get("pair", "")
                     if pair and pair not in allow:
                         continue
@@ -1311,11 +1370,13 @@ class RubaihBot:
                         entry_price=avg,
                         unrealized_pnl=upnl,
                     ))
-                # One position at a time — keep first allowlisted long if multiples
                 if len(positions) > 1:
                     positions = positions[:1]
                 if positions:
                     await self._set_active_pair(positions[0].symbol)
+                    # Mirror into cycle tracker so exits/dashboard stay consistent
+                    if self._mode == "futures_cycle":
+                        self._dry_pos = positions[0]
                 self.portfolio.update_positions(positions)
             except Exception as e:
                 print(f"[SYNC] Error: {e}")
@@ -1368,16 +1429,22 @@ class RubaihBot:
     async def main_loop(self):
         while self._running and self.risk.alive:
             try:
-                greeks = self.portfolio.compute_greeks()
                 spot = self._mid_for(self._active_pair)
                 if spot <= 0 and not self._pair_mids:
                     await asyncio.sleep(1)
                     continue
-                if spot <= 0:
-                    spot = next(iter(self._pair_mids.values()), 0.0)
 
+                await self._publish_snapshot()
+                size, side, _pair = self._position_meta()
+                greeks = self.portfolio.compute_greeks()
+                if self._mode == "futures_cycle" and size > 0:
+                    signed = size if side == "long" else -size
+                    greeks = GreeksSnapshot(
+                        timestamp=time.time(), delta=signed, gamma=0.0, vega=0.0, theta=0.0,
+                    )
                 session_pnl = sum(p.unrealized_pnl for p in self.portfolio.positions.values())
-                await self.store.save_greeks(greeks, spot, session_pnl, active_pair=self._active_pair)
+                if self._dry_pos:
+                    session_pnl = self._dry_pos.unrealized_pnl
 
                 violation = self.risk.check(greeks, session_pnl)
                 if violation:
@@ -1415,11 +1482,13 @@ class RubaihBot:
                             await self._set_active_pair(signal.pair)
                         print(f"[CYCLE] {signal.reason}")
                         await self._execute_hedge(signal)
+                        await self._publish_snapshot()
                 else:
-                    signal = self.strategist.evaluate(greeks, spot)
+                    signal = self.strategist.evaluate(greeks, spot if spot > 0 else next(iter(self._pair_mids.values()), 0.0))
                     if signal and signal.hedge_size != 0:
                         print(f"[HEDGE] {signal.reason}")
                         await self._execute_hedge(signal)
+                        await self._publish_snapshot()
             except Exception as e:
                 print(f"[LOOP] Error: {e}")
             await asyncio.sleep(1)
@@ -1447,12 +1516,11 @@ class RubaihBot:
             spot = self.portfolio.spot_prices.get(perp_prod.underlying, 0.0)
 
         async def _place(qty: float):
-            if qty < perp_prod.min_quantity:
+            if qty <= 0 or qty < perp_prod.min_quantity:
                 print(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
                 return False
             live_ok = self._live and self.client and self.client._auth_ok
             if not live_ok:
-                # LIVE_TRADING=true but auth failed → simulate (same as dry-run) so cycle can progress
                 if self._live and self.client and not self.client._auth_ok:
                     if not getattr(self, "_live_block_warned", False):
                         self._live_block_warned = True
@@ -1463,12 +1531,23 @@ class RubaihBot:
                     print(f"[SIM] Would {side.value} {qty} {perp_symbol} @ ~{spot} (auth blocked)")
                 else:
                     print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
-                await self.store.save_hedge(signal, spot)
+                await self.store.save_hedge(signal, spot, size=qty)
                 self._apply_dry_fill(perp_symbol, side, qty, spot)
                 return True
+
             result = await self.client.place_order(perp_prod.pair, side, qty, "market", self._leverage)
             print(f"[HEDGE] LIVE order: {result}")
-            await self.store.save_hedge(signal, spot)
+            # Treat explicit API errors as failed — do not record a phantom fill
+            if isinstance(result, dict) and (
+                result.get("status") == "error"
+                or result.get("code") in (400, 401, 403, 500, "400", "401", "403", "500")
+                or result.get("error")
+            ):
+                print(f"[HEDGE] Order rejected — not updating position: {result}")
+                return False
+            await self.store.save_hedge(signal, spot, size=qty)
+            # Always update local cycle position so dashboard/exits work immediately
+            self._apply_dry_fill(perp_symbol, side, qty, spot)
             return True
 
         if size > cfg["max_order_size_btc"]:
@@ -1485,12 +1564,22 @@ class RubaihBot:
             await _place(qty)
 
     def _apply_dry_fill(self, symbol: str, side: Side, qty: float, price: float):
-        """Simulate position so futures_cycle can exercise exits in dry-run."""
+        """Update local cycle position (dry-run and live) so dashboard reflects fills."""
         if self._mode != "futures_cycle" or qty <= 0:
             return
+        # Ensure product exists so compute_greeks can see the position
+        if symbol not in self.products:
+            base = symbol.replace("B-", "").replace("I-", "").split("_")[0]
+            prod = CoinDCXProduct(pair=symbol, symbol=symbol, underlying=base, is_perp=True)
+            self.products[symbol] = prod
+            self.portfolio.update_product(prod)
+        if price > 0 and symbol in self.products:
+            self.portfolio.update_spot(self.products[symbol].underlying, price)
+            self._pair_mids[symbol] = price
+
         pos = self._dry_pos
         if side == Side.BUY:
-            if pos and pos.side == "buy":
+            if pos and pos.side == "buy" and pos.symbol == symbol:
                 new_size = pos.size + qty
                 pos.entry_price = ((pos.entry_price * pos.size) + price * qty) / new_size
                 pos.size = new_size
@@ -1508,7 +1597,6 @@ class RubaihBot:
                 else:
                     pos.size = remain
             else:
-                # opening short not used in long-only; clear
                 self._dry_pos = None
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
