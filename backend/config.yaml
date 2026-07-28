@@ -21,8 +21,9 @@ trading:
   # flat → scan → buy → sell cycle
   mode: futures_cycle
 
-  # Account sizing — ₹5000 INR margin wallet
+  # Account sizing — ₹5000 INR margin wallet; each trade aims ~₹2000 margin
   capital_inr: 5000
+  target_margin_inr: 2000
   leverage: 10
   usdt_inr: 87
   margin_buffer: 0.85
@@ -37,26 +38,28 @@ trading:
   scan_interval_sec: 5
 
   delta_threshold: 0.0005
-  max_delta: 0.05
+  # Position size is coin units (ETH can be 0.05+) — do not treat like options delta
+  max_delta: 100.0
   max_vega: 100.0
   max_drawdown_pct: 0.15
 
-  min_hedge_interval_sec: 60
+  min_hedge_interval_sec: 45
   cost_buffer_multiplier: 1.2
 
-  max_order_size_btc: 0.01
+  # Cap per order in coin units (high enough for ETH/SOL lots)
+  max_order_size_btc: 2.0
   twap_slices: 1
   twap_interval_sec: 5
 
   strategy:
-    entry_cooldown_sec: 120
-    momentum_lookback: 30
-    entry_move_pct: 0.0015
-    take_profit_pct: 0.004
-    stop_loss_pct: 0.003
+    entry_cooldown_sec: 90
+    momentum_lookback: 24
+    entry_move_pct: 0.0012
+    # Round-trip taker ~0.15%; TP must clear fees with room
+    take_profit_pct: 0.005
+    stop_loss_pct: 0.0035
     max_hold_sec: 1800
     allow_short: false
-    position_size_btc: 0.001
 
 risk:
   kill_switch_on_drawdown: true

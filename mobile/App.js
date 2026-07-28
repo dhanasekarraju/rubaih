@@ -389,7 +389,7 @@ export default function App() {
 
               {dashboard && (
                 <View style={styles.heroCard}>
-                  <Text style={styles.heroLabel}>{pairBase} Mark (USDT)</Text>
+                  <Text style={styles.heroLabel}>{pairBase} Mark</Text>
                   <Text style={styles.heroPair}>{activePair}</Text>
                   <Text style={styles.heroPrice}>{formatUsdt(dashboard.spot_price)}</Text>
                   <Text style={styles.pnlLine}>Session PnL: {formatInr(dashboard.session_pnl)}</Text>
@@ -399,12 +399,7 @@ export default function App() {
                       borderColor: dashboard.live_trading ? COLORS.red : COLORS.cyan,
                     }]}>
                       <Text style={[styles.badgeText, { color: dashboard.live_trading ? COLORS.red : COLORS.cyan }]}>
-                        {dashboard.live_trading ? 'LIVE ORDERS' : 'DRY-RUN'}
-                      </Text>
-                    </View>
-                    <View style={[styles.badge, { backgroundColor: COLORS.goldDim, borderColor: COLORS.gold }]}>
-                      <Text style={[styles.badgeText, { color: COLORS.gold }]}>
-                        {dashboard.ai_enabled ? 'AI ON' : 'AI OFF'}
+                        {dashboard.live_trading ? 'LIVE' : 'DRY-RUN'}
                       </Text>
                     </View>
                     <View style={[styles.badge, { backgroundColor: COLORS.cyanDim, borderColor: COLORS.cyan }]}>
@@ -430,7 +425,6 @@ export default function App() {
                         ? COLORS.gold
                         : COLORS.green
                     }
-                    icon="Δ"
                   />
                   <GreekCard
                     label="Side"
@@ -450,48 +444,42 @@ export default function App() {
                           ? COLORS.red
                           : COLORS.green
                     }
-                    icon="◎"
                   />
                   <GreekCard
                     label="Pair"
                     value={pairBase}
                     color={COLORS.gold}
-                    icon="◎"
                   />
                   <GreekCard
                     label="Trades 24h"
                     value={String(dashboard.num_positions ?? 0)}
                     color={COLORS.purple}
-                    icon="#"
                   />
                 </View>
               )}
 
               {dashboard && (dashboard.position_size > 0 || Math.abs(dashboard.delta || 0) >= 0.00005) ? null : (
                 <View style={styles.infoCard}>
-                  <Text style={styles.infoTitle}>Why Position is 0</Text>
+                  <Text style={styles.infoTitle}>Flat — scanning</Text>
                   <Text style={styles.infoBody}>
-                    You are flat (no open futures on {activePair}).{"\n"}
-                    Scanner picks the best momentum pair when flat.{"\n"}
-                    After a buy, Position / Side update here (Gamma/Vega/Theta are N/A for futures).
+                    Looking across majors + alts for momentum.{"\n"}
+                    Target ~₹{fmtSetting(settings?.target_margin_inr || 2000)} margin per buy @ {fmtSetting(settings?.leverage || 10)}x.
                   </Text>
                 </View>
               )}
 
               {dashboard?.ai_last_action && (
-                <View style={[styles.aiCard, { borderColor: COLORS.purple }]}>
-                  <View style={styles.aiCardHeader}>
-                    <Text style={styles.aiCardTitle}>Latest AI Decision</Text>
-                  </View>
+                <View style={styles.aiCard}>
+                  <Text style={styles.aiCardTitle}>Latest AI</Text>
                   <View style={styles.aiCardRow}>
-                    <Text style={[styles.aiAction, { color: getActionColor(dashboard.ai_last_action) }]}>
-                      {dashboard.ai_last_action}
-                    </Text>
-                    <View style={[styles.confidenceBadge, { backgroundColor: COLORS.purpleDim }]}>
-                      <Text style={[styles.confidenceText, { color: COLORS.purple }]}>
-                        {((dashboard.ai_confidence || 0) * 100).toFixed(0)}% confidence
+                    <View style={[styles.aiActionPill, { backgroundColor: getActionStyle(dashboard.ai_last_action).bg }]}>
+                      <Text style={[styles.aiActionPillText, { color: getActionStyle(dashboard.ai_last_action).fg }]}>
+                        {String(dashboard.ai_last_action).toUpperCase()}
                       </Text>
                     </View>
+                    <Text style={styles.confidencePlain}>
+                      {((dashboard.ai_confidence || 0) * 100).toFixed(0)}% conf
+                    </Text>
                   </View>
                 </View>
               )}
@@ -500,8 +488,8 @@ export default function App() {
 
           {activeTab === 'hedges' && (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Recent Hedge Trades</Text>
-              {history.length === 0 && <Text style={styles.empty}>No hedges yet</Text>}
+              <Text style={styles.cardTitle}>Recent Trades</Text>
+              {history.length === 0 && <Text style={styles.empty}>No trades yet</Text>}
               {history.map((h, i) => (
                 <View key={h.id} style={[styles.tradeRow, i === 0 && styles.tradeRowFirst]}>
                   <View style={[styles.tradeSideBadge, { backgroundColor: h.side === 'buy' ? COLORS.greenDim : COLORS.redDim }]}>
@@ -518,25 +506,26 @@ export default function App() {
           )}
 
           {activeTab === 'ai' && (
-            <View style={[styles.card, { borderColor: COLORS.purple }]}>
-              <Text style={[styles.cardTitle, { color: COLORS.purple }]}>AI Decision History</Text>
+            <View style={styles.card}>
+              <Text style={[styles.cardTitle, { color: COLORS.gold }]}>AI Decisions</Text>
               {aiDecisions.length === 0 && <Text style={styles.empty}>No AI decisions yet</Text>}
-              {aiDecisions.map((d, i) => (
-                <View key={d.id} style={[styles.aiDecisionRow, i === 0 && styles.tradeRowFirst]}>
-                  <View style={styles.aiDecisionLeft}>
-                    <Text style={[styles.aiDecisionAction, { color: getActionColor(d.action) }]}>{d.action}</Text>
-                    <Text style={styles.aiDecisionModel}>{(d.model || '').split('/').pop()}</Text>
-                  </View>
-                  <View style={styles.aiDecisionRight}>
-                    <View style={[styles.confidenceBadge, { backgroundColor: COLORS.purpleDim }]}>
-                      <Text style={[styles.confidenceText, { color: COLORS.purple }]}>
-                        {(d.confidence * 100).toFixed(0)}%
-                      </Text>
+              {aiDecisions.map((d, i) => {
+                const st = getActionStyle(d.action);
+                return (
+                  <View key={d.id} style={[styles.aiDecisionRow, i === 0 && styles.tradeRowFirst]}>
+                    <View style={styles.aiDecisionLeft}>
+                      <View style={[styles.aiActionPill, { backgroundColor: st.bg, alignSelf: 'flex-start' }]}>
+                        <Text style={[styles.aiActionPillText, { color: st.fg }]}>{String(d.action).toUpperCase()}</Text>
+                      </View>
+                      <Text style={styles.aiDecisionModel}>{(d.model || '').split('/').pop()}</Text>
                     </View>
-                    <Text style={styles.aiDecisionRisk}>{d.risk_assessment}</Text>
+                    <View style={styles.aiDecisionRight}>
+                      <Text style={styles.confidencePlain}>{(d.confidence * 100).toFixed(0)}%</Text>
+                      <Text style={styles.aiDecisionRisk}>{d.risk_assessment}</Text>
+                    </View>
                   </View>
-                </View>
-              ))}
+                );
+              })}
             </View>
           )}
 
@@ -563,14 +552,13 @@ export default function App() {
                 <Text style={styles.cardTitle}>Bot Settings (from server · read-only)</Text>
                 <SettingsRow label="Mode" value={fmtSetting(settings?.mode || 'futures_cycle')} />
                 <SettingsRow label="Capital" value={fmtSetting(settings?.capital_inr, ' INR')} />
+                <SettingsRow label="Target margin" value={fmtSetting(settings?.target_margin_inr || 2000, ' INR')} />
                 <SettingsRow label="Margin" value={fmtSetting(settings?.margin_currency || 'INR')} />
                 <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
                 <SettingsRow label="Exchange" value="CoinDCX" />
-                <SettingsRow label="Pair" value={fmtSetting(settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT')} />
+                <SettingsRow label="Active pair" value={fmtSetting(settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT')} />
                 <SettingsRow label="Scan pairs" value={fmtSetting(settings?.scan_pairs || '—')} />
                 <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
-                <SettingsRow label="Delta Threshold" value={fmtSetting(settings?.delta_threshold, pairUnit)} />
-                <SettingsRow label="Max Delta" value={fmtSetting(settings?.max_delta, pairUnit)} />
               </View>
             </>
           )}
@@ -646,12 +634,17 @@ export default function App() {
 
 function GreekCard({ label, value, unit = '', color, icon }) {
   return (
-    <View style={[styles.greekCard, { borderColor: color }]}>
-      <View style={[styles.greekIconBox, { backgroundColor: color + '22' }]}>
-        <Text style={[styles.greekIcon, { color }]}>{icon}</Text>
-      </View>
+    <View style={[styles.greekCard, { borderColor: color + '66' }]}>
+      {icon ? (
+        <View style={[styles.greekIconBox, { backgroundColor: color + '22' }]}>
+          <Text style={[styles.greekIcon, { color }]}>{icon}</Text>
+        </View>
+      ) : null}
       <Text style={styles.greekLabel}>{label}</Text>
-      <Text style={[styles.greekValue, { color }]}>{value}{unit}</Text>
+      <Text style={[styles.greekValue, { color }]}>
+        {value}
+        {unit ? <Text style={{ fontSize: 12, fontWeight: '500' }}>{unit}</Text> : null}
+      </Text>
     </View>
   );
 }
@@ -665,12 +658,17 @@ function SettingsRow({ label, value }) {
   );
 }
 
+function getActionStyle(action) {
+  const a = String(action || '').toUpperCase();
+  if (a === 'HEDGE' || a === 'BUY' || a === 'ENTRY') return { bg: COLORS.cyan, fg: '#04140f' };
+  if (a === 'HOLD') return { bg: COLORS.green, fg: '#04140f' };
+  if (a === 'EMERGENCY' || a === 'SELL' || a === 'EXIT') return { bg: COLORS.red, fg: '#ffffff' };
+  if (a === 'ADJUST_THRESHOLD') return { bg: COLORS.orange, fg: '#04140f' };
+  return { bg: COLORS.gold, fg: '#04140f' };
+}
+
 function getActionColor(action) {
-  if (action === 'HEDGE') return COLORS.cyan;
-  if (action === 'HOLD') return COLORS.green;
-  if (action === 'EMERGENCY') return COLORS.red;
-  if (action === 'ADJUST_THRESHOLD') return COLORS.orange;
-  return COLORS.text;
+  return getActionStyle(action).bg;
 }
 
 const styles = StyleSheet.create({
@@ -743,9 +741,12 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderLeftWidth: 3,
   },
   aiCardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
-  aiCardTitle: { fontSize: 14, fontWeight: '600', color: COLORS.purple },
+  aiCardTitle: { fontSize: 14, fontWeight: '600', color: COLORS.textSecondary, marginBottom: 10 },
   aiCardRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   aiAction: { fontSize: 20, fontWeight: 'bold' },
+  aiActionPill: { borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
+  aiActionPillText: { fontSize: 14, fontWeight: '800', letterSpacing: 0.5 },
+  confidencePlain: { color: COLORS.text, fontSize: 13, fontWeight: '600' },
   confidenceBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 },
   confidenceText: { fontSize: 11, fontWeight: '600' },
   card: {

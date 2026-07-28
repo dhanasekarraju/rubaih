@@ -506,23 +506,27 @@ class FuturesCycleStrategist:
     def __init__(self):
         tcfg = CFG["trading"]
         scfg = tcfg.get("strategy") or {}
-        self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 120))
-        self.lookback = int(scfg.get("momentum_lookback", 30))
-        self.entry_move_pct = float(scfg.get("entry_move_pct", 0.0015))
-        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.004))
-        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.003))
+        self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 90))
+        self.lookback = int(scfg.get("momentum_lookback", 24))
+        self.entry_move_pct = float(scfg.get("entry_move_pct", 0.0012))
+        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.005))
+        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.0035))
         self.max_hold_sec = float(scfg.get("max_hold_sec", 1800))
         self.allow_short = bool(scfg.get("allow_short", False))
-        self.target_size = float(scfg.get("position_size_btc", tcfg.get("max_order_size_btc", 0.001)))
+        # Prefer INR margin target (works for BTC/ETH/SOL). Legacy position_size_btc is only a soft cap if set.
+        self.target_margin_inr = float(tcfg.get("target_margin_inr", 2000))
+        self.target_size = float(scfg.get("position_size_btc", 0) or 0)  # 0 = uncapped by coin units
         self.capital_inr = float(tcfg.get("capital_inr", 5000))
         self.leverage = int(tcfg.get("leverage", 10))
         self.usdt_inr = float(tcfg.get("usdt_inr", 87))
         self.margin_buffer = float(tcfg.get("margin_buffer", 0.85))
-        self.min_interval = float(tcfg.get("min_hedge_interval_sec", 60))
+        self.taker_fee = float(CFG.get("exchange", {}).get("taker_fee", 0.00075))
+        self.min_interval = float(tcfg.get("min_hedge_interval_sec", 45))
         self._last_signal = 0.0
         self._entry_ts = 0.0
         self._prices: Dict[str, Deque[float]] = {}
         self._last_scan_log = 0.0
+        self._last_entry_pair: Optional[str] = None
 
     def _buf(self, pair: str) -> Deque[float]:
         if pair not in self._prices:
@@ -535,13 +539,24 @@ class FuturesCycleStrategist:
             self._buf(key).append(float(mid))
 
     def affordable_qty(self, spot: float, min_qty: float) -> float:
-        """Max size from INR capital / leverage / FX, capped by target_size."""
+        """Size from target INR margin × leverage (same ₹ for BTC/ETH/SOL)."""
         if spot <= 0 or self.usdt_inr <= 0 or self.leverage <= 0:
             return 0.0
         usable_inr = self.capital_inr * self.margin_buffer
-        max_size = (usable_inr * self.leverage) / (spot * self.usdt_inr)
-        qty = min(self.target_size, max_size)
+        target_margin = min(self.target_margin_inr, usable_inr)
+        if target_margin <= 0:
+            return 0.0
+        notional_inr = target_margin * self.leverage
+        qty = notional_inr / (spot * self.usdt_inr)
+        max_qty = (usable_inr * self.leverage) / (spot * self.usdt_inr)
+        qty = min(qty, max_qty)
+        if self.target_size > 0:
+            qty = min(qty, self.target_size)
         if qty + 1e-12 < min_qty:
+            # Bump to exchange minimum if that min still fits capital
+            min_margin = (min_qty * spot * self.usdt_inr) / self.leverage
+            if min_margin <= usable_inr * 1.001:
+                return float(min_qty)
             return 0.0
         return qty
 
@@ -566,33 +581,64 @@ class FuturesCycleStrategist:
             return None
 
         ranked = []
+        skipped_size = 0
+        skipped_move = 0
+        warming = 0
         for pair, spot in pair_mids.items():
             if spot <= 0:
                 continue
             move = self._move_pct(pair, spot)
-            if move is None or move < self.entry_move_pct:
+            if move is None:
+                warming += 1
+                continue
+            if move < self.entry_move_pct:
+                skipped_move += 1
                 continue
             min_q = float(min_qty_by_pair.get(pair, 0.001) or 0.001)
             qty = self.affordable_qty(spot, min_q)
             if qty <= 0:
+                skipped_size += 1
                 continue
-            ranked.append((move, pair, spot, qty, min_q))
+            # Light anti-stickiness: de-rank the pair we just traded
+            score = move
+            if pair == self._last_entry_pair:
+                score *= 0.85
+            margin_inr = (qty * spot * self.usdt_inr) / max(self.leverage, 1)
+            ranked.append((score, move, pair, spot, qty, margin_inr))
 
         if now - self._last_scan_log > 30:
             self._last_scan_log = now
-            top = ", ".join(f"{p}:{m:.2%}" for m, p, *_ in sorted(ranked, reverse=True)[:5]) or "none"
-            print(f"[SCAN] candidates={len(pair_mids)} qualifying={len(ranked)} top=[{top}]")
+            top = ", ".join(
+                f"{p}:{m:.2%}~₹{mar:.0f}" for _s, m, p, _sp, _q, mar in sorted(ranked, reverse=True)[:5]
+            ) or "none"
+            print(
+                f"[SCAN] candidates={len(pair_mids)} qualifying={len(ranked)} "
+                f"warm={warming} flat={skipped_move} unaffordable={skipped_size} top=[{top}]"
+            )
 
         if not ranked:
             return None
 
         ranked.sort(reverse=True)
-        move, pair, spot, qty, _min_q = ranked[0]
+        _score, move, pair, spot, qty, margin_inr = ranked[0]
+        # Fee sanity: expected TP INR should beat round-trip fees
+        notional_inr = qty * spot * self.usdt_inr
+        fee_inr = notional_inr * self.taker_fee * 2
+        tp_inr = notional_inr * self.take_profit_pct
+        if tp_inr < fee_inr * 1.5:
+            print(
+                f"[SCAN] skip {pair}: TP ₹{tp_inr:.0f} < 1.5× fees ₹{fee_inr:.0f} "
+                f"(raise target_margin_inr or take_profit_pct)"
+            )
+            return None
+
         self._last_signal = now
         self._entry_ts = now
+        self._last_entry_pair = pair
         return HedgeSignal(
             now, qty, 0.0, qty, "passive",
-            f"ENTRY_LONG: {pair} move={move:.2%} size={qty}", False,
+            f"ENTRY_LONG: {pair} move={move:.2%} size={qty:.6f} margin~₹{margin_inr:.0f}",
+            False,
             pair=pair,
         )
 
@@ -872,6 +918,7 @@ class RubaihBot:
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 5000)),
+            "target_margin_inr": str(cfg.get("target_margin_inr", 2000)),
             "leverage": str(cfg.get("leverage", 10)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
@@ -881,7 +928,10 @@ class RubaihBot:
             "scan_enabled": str(self._scan_enabled).lower(),
             "scan_pairs": ",".join(self._scan_pairs),
         }
-        force_keys = ("mode", "capital_inr", "leverage", "perp_symbol", "margin_currency", "live_trading")
+        force_keys = (
+            "mode", "capital_inr", "target_margin_inr", "leverage",
+            "perp_symbol", "margin_currency", "live_trading", "max_delta",
+        )
         existing = await self.store.rd.hgetall("rubaih:settings")
         merged = dict(existing or {})
         merged.update(defaults)
@@ -893,11 +943,18 @@ class RubaihBot:
                 self.cycle.leverage = self._leverage
             elif k == "capital_inr":
                 self.cycle.capital_inr = float(defaults["capital_inr"])
+            elif k == "target_margin_inr":
+                self.cycle.target_margin_inr = float(defaults["target_margin_inr"])
             elif k == "mode":
                 self._mode = str(defaults["mode"]).strip().lower()
+            elif k == "max_delta":
+                self.risk.max_delta = float(defaults["max_delta"])
         self.cycle.margin_buffer = float(cfg.get("margin_buffer", 0.85))
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
-        print(f"[SETTINGS] Forced from config: mode={self._mode} capital=₹{self.cycle.capital_inr} lev={self._leverage}x")
+        print(
+            f"[SETTINGS] Forced from config: mode={self._mode} capital=₹{self.cycle.capital_inr} "
+            f"target_margin=₹{self.cycle.target_margin_inr} lev={self._leverage}x"
+        )
 
     async def _set_active_pair(self, pair: str):
         if not pair:
@@ -923,13 +980,16 @@ class RubaihBot:
             self.risk.max_dd = float(data["max_drawdown_pct"])
         if "capital_inr" in data:
             self.cycle.capital_inr = float(data["capital_inr"])
+        if "target_margin_inr" in data:
+            self.cycle.target_margin_inr = float(data["target_margin_inr"])
         if "leverage" in data:
             self._leverage = int(float(data["leverage"]))
             self.cycle.leverage = self._leverage
         print(
             f"[SETTINGS] mode={self._mode} threshold={self.strategist.delta_threshold} "
             f"max_delta={self.risk.max_delta} max_vega={self.risk.max_vega} "
-            f"max_dd={self.risk.max_dd} capital_inr={self.cycle.capital_inr} lev={self._leverage}"
+            f"max_dd={self.risk.max_dd} capital_inr={self.cycle.capital_inr} "
+            f"target_margin=₹{self.cycle.target_margin_inr} lev={self._leverage}"
         )
     async def command_listener(self):
         """Honor kill-switch / settings from authenticated API. Reconnects if Redis drops."""
@@ -1088,7 +1148,7 @@ class RubaihBot:
         print(f"[RUBAIH] Active pair: {self._active_pair}")
         print(f"[RUBAIH] AI augmentation: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
         print(f"[RUBAIH] LIVE_TRADING: {'ON — real orders' if self._live else 'OFF — dry-run only'}")
-        print(f"[RUBAIH] Capital target: ₹{CFG['trading'].get('capital_inr', '?')} INR-M @ {self._leverage}x")
+        print(f"[RUBAIH] Capital: ₹{CFG['trading'].get('capital_inr', '?')} | target margin/trade: ₹{CFG['trading'].get('target_margin_inr', 2000)} @ {self._leverage}x")
         print(f"[RUBAIH] Margin currency: {MARGIN_CCY}")
         await self.store.rd.hset(
             "rubaih:settings",
