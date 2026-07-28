@@ -87,10 +87,11 @@ class OpenRouterAI:
         self.session: Optional[aiohttp.ClientSession] = None
         self._call_history: List[Dict] = []
         self._last_call: float = 0.0
-        self._min_interval = 60.0
+        self._min_interval = 180.0  # 3 min between AI attempts
         self._fail_streak = 0
         self._backoff_until = 0.0
         self._dead_models: Dict[str, float] = {}
+        self._gemini_warned = False
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -161,12 +162,14 @@ What is your decision?"""
                     out = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
                     return out or None
                 if resp.status == 429:
-                    self._dead_models["gemini"] = time.time() + 300
-                    print("[AI] Gemini rate limited — cooling 5m, trying OpenRouter")
+                    self._dead_models["gemini"] = time.time() + 1800  # 30 min
+                    if not self._gemini_warned:
+                        self._gemini_warned = True
+                        print("[AI] Gemini rate limited — skip 30m, using OpenRouter")
                     return None
                 if resp.status in (400, 403, 404):
-                    self._dead_models["gemini"] = time.time() + 600
-                    print(f"[AI] Gemini error {resp.status}: {text[:160]} — falling back to OpenRouter")
+                    self._dead_models["gemini"] = time.time() + 1800
+                    print(f"[AI] Gemini error {resp.status}: {text[:120]} — OpenRouter fallback")
                     return None
                 print(f"[AI] Gemini error {resp.status}: {text[:160]}")
                 return None
@@ -284,3 +287,8 @@ What is your decision?"""
         if self._fail_streak <= 3 or self._fail_streak % 10 == 0:
             print(f"[AI] Gemini+OpenRouter failed (x{self._fail_streak}). Quant continues. Retry in {wait:.0f}s")
         return None
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None

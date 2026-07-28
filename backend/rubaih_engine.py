@@ -678,6 +678,8 @@ class DataStore:
             lib_version=None,
             socket_connect_timeout=5,
             socket_timeout=5,
+            socket_keepalive=True,
+            health_check_interval=30,
             retry_on_timeout=True,
         )
         await self.rd.ping()
@@ -838,40 +840,71 @@ class RubaihBot:
             f"max_dd={self.risk.max_dd} capital_inr={self.cycle.capital_inr} lev={self._leverage}"
         )
     async def command_listener(self):
-        """Honor kill-switch / settings from authenticated API."""
-        pubsub = self.store.rd.pubsub()
-        await pubsub.subscribe("rubaih:command")
-        print("[CMD] Listening on rubaih:command")
-        try:
-            while self._running:
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if not message or not message.get("data"):
-                    await asyncio.sleep(0.05)
-                    continue
-                try:
-                    payload = json.loads(message["data"])
-                except Exception:
-                    continue
-                cmd = payload.get("command")
-                if cmd == "KILL_SWITCH":
-                    reason = f"API_KILL_SWITCH from {payload.get('source', 'unknown')}"
-                    print(f"[CMD] {reason}")
-                    self.risk.trigger_kill(reason)
-                    await self.store.save_risk_event("KILL_SWITCH", reason)
-                    await self.store.set_engine_status("kill_switch")
-                    await self._emergency_unwind()
-                    break
-                if cmd == "UPDATE_SETTINGS":
-                    data = payload.get("data") or {}
-                    await self._apply_settings(data)
-                    await self.store.rd.hset("rubaih:settings", mapping={k: str(v) for k, v in data.items()})
-                    await self.store.save_risk_event("SETTINGS_UPDATE", json.dumps(data))
-        finally:
+        """Honor kill-switch / settings from authenticated API. Reconnects if Redis drops."""
+        while self._running:
+            pubsub = None
             try:
-                await pubsub.unsubscribe()
-                await pubsub.close()
-            except Exception:
-                pass
+                if self.store.rd is None:
+                    await self.store.connect()
+                pubsub = self.store.rd.pubsub()
+                await pubsub.subscribe("rubaih:command")
+                print("[CMD] Listening on rubaih:command")
+                while self._running:
+                    try:
+                        message = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=1.0
+                        )
+                    except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+                        print(f"[CMD] Redis pubsub error: {e}. Reconnecting in 3s...")
+                        break
+                    if not message or not message.get("data"):
+                        await asyncio.sleep(0.05)
+                        continue
+                    try:
+                        payload = json.loads(message["data"])
+                    except Exception:
+                        continue
+                    cmd = payload.get("command")
+                    if cmd == "KILL_SWITCH":
+                        reason = f"API_KILL_SWITCH from {payload.get('source', 'unknown')}"
+                        print(f"[CMD] {reason}")
+                        self.risk.trigger_kill(reason)
+                        await self.store.save_risk_event("KILL_SWITCH", reason)
+                        await self.store.set_engine_status("kill_switch")
+                        await self._emergency_unwind()
+                        return
+                    if cmd == "UPDATE_SETTINGS":
+                        data = payload.get("data") or {}
+                        await self._apply_settings(data)
+                        await self.store.rd.hset(
+                            "rubaih:settings", mapping={k: str(v) for k, v in data.items()}
+                        )
+                        await self.store.save_risk_event("SETTINGS_UPDATE", json.dumps(data))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[CMD] Listener error: {e}. Retry in 3s...")
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.unsubscribe()
+                        await pubsub.close()
+                    except Exception:
+                        pass
+            if self._running:
+                await asyncio.sleep(3)
+
+    async def _supervised(self, name: str, coro_factory):
+        """Restart a background loop on unexpected errors (don't kill the whole bot)."""
+        while self._running:
+            try:
+                await coro_factory()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[SUPERVISE] {name} crashed: {e}. Restarting in 5s...")
+                await asyncio.sleep(5)
 
     async def bootstrap(self):
         print("[RUBAIH] Bootstrapping CoinDCX...")
@@ -1081,6 +1114,24 @@ class RubaihBot:
                     await asyncio.sleep(10)
                     continue
 
+                # Also keep simulated pos when LIVE but CoinDCX auth is down
+                if (
+                    self._live
+                    and self.client
+                    and not self.client._auth_ok
+                    and self._mode == "futures_cycle"
+                    and self._dry_pos
+                ):
+                    spot = self.portfolio.spot_prices.get(CFG["trading"]["underlying"], 0.0)
+                    if spot > 0 and self._dry_pos.entry_price > 0:
+                        direction = 1.0 if self._dry_pos.side == "buy" else -1.0
+                        self._dry_pos.unrealized_pnl = (
+                            (spot - self._dry_pos.entry_price) * self._dry_pos.size * direction
+                        )
+                    self.portfolio.update_positions([self._dry_pos])
+                    await asyncio.sleep(10)
+                    continue
+
                 raw = await self.client.get_positions(pairs=target)
                 if not raw:
                     raw = await self.client.get_positions()
@@ -1118,7 +1169,7 @@ class RubaihBot:
             await asyncio.sleep(10)
 
     async def ai_analysis_loop(self):
-        """Periodic AI analysis — runs every 60 seconds."""
+        """Periodic AI analysis — quiet; quant/cycle remains authority."""
         if not self._ai_enabled:
             return
         while self._running and self.risk.alive:
@@ -1126,7 +1177,7 @@ class RubaihBot:
                 greeks = self.portfolio.compute_greeks()
                 spot = self.portfolio.spot_prices.get(CFG["trading"]["underlying"], 0.0)
                 if spot <= 0:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                     continue
 
                 self._hedge_history = await self.store.get_recent_hedges(5)
@@ -1149,7 +1200,7 @@ class RubaihBot:
                 decision = await self.ai.analyze_market(context)
                 if decision:
                     await self.store.save_ai_decision(decision, greeks.delta)
-                    print(f"[AI] {decision.model_used}: {decision.action} ({decision.confidence:.0%} confidence)")
+                    # analyze_market already prints once — avoid duplicate line
 
                     if decision.action == "EMERGENCY" and decision.confidence > 0.95:
                         self.risk.trigger_kill(f"AI_EMERGENCY: {decision.reasoning}")
@@ -1159,7 +1210,7 @@ class RubaihBot:
                         break
             except Exception as e:
                 print(f"[AI LOOP] Error: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(180)  # 3 min — free tiers rate-limit hard
 
     async def main_loop(self):
         target = CFG["trading"]["perp_symbol"]
@@ -1221,14 +1272,18 @@ class RubaihBot:
                 print(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
                 return False
             live_ok = self._live and self.client and self.client._auth_ok
-            if self._live and self.client and not self.client._auth_ok:
-                print(
-                    f"[LIVE BLOCKED] Auth failed — not sending {side.value} {qty} {perp_symbol}. "
-                    "Fix CoinDCX keys or set LIVE_TRADING=false"
-                )
-                return False
             if not live_ok:
-                print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
+                # LIVE_TRADING=true but auth failed → simulate (same as dry-run) so cycle can progress
+                if self._live and self.client and not self.client._auth_ok:
+                    if not getattr(self, "_live_block_warned", False):
+                        self._live_block_warned = True
+                        print(
+                            "[LIVE BLOCKED] CoinDCX auth failed — simulating fills until AUTH OK. "
+                            "Set LIVE_TRADING=false or fix API keys."
+                        )
+                    print(f"[SIM] Would {side.value} {qty} {perp_symbol} @ ~{spot} (auth blocked)")
+                else:
+                    print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
                 await self.store.save_hedge(signal, spot)
                 self._apply_dry_fill(perp_symbol, side, qty, spot)
                 return True
@@ -1315,14 +1370,14 @@ class RubaihBot:
         print("=" * 60 + "\n")
 
         tasks = [
-            self.command_listener(),
-            self.ws_listener(),
-            self.price_poller(),
-            self.sync_positions(),
-            self.main_loop(),
+            self._supervised("command_listener", self.command_listener),
+            self._supervised("ws_listener", self.ws_listener),
+            self._supervised("price_poller", self.price_poller),
+            self._supervised("sync_positions", self.sync_positions),
+            self._supervised("main_loop", self.main_loop),
         ]
         if self._ai_enabled:
-            tasks.append(self.ai_analysis_loop())
+            tasks.append(self._supervised("ai_analysis_loop", self.ai_analysis_loop))
 
         await asyncio.gather(*tasks)
 
