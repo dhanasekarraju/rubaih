@@ -305,6 +305,29 @@ async def kill_switch():
     }
 
 
+@app.get("/api/scan", dependencies=[Depends(require_token)])
+async def get_scan():
+    raw = await rd_client.get("rubaih:scan")
+    if not raw:
+        return {"ts": None, "pairs": []}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ts": None, "pairs": []}
+
+
+@app.get("/api/logs", dependencies=[Depends(require_token)])
+async def get_logs(limit: int = Query(default=80, ge=1, le=200)):
+    rows = await rd_client.lrange("rubaih:logs", 0, limit - 1)
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r))
+        except Exception:
+            out.append({"ts": None, "line": str(r)})
+    return out
+
+
 @app.get("/api/settings", dependencies=[Depends(require_token)])
 async def get_settings():
     settings = await rd_client.hgetall("rubaih:settings")
@@ -401,7 +424,7 @@ async def websocket_endpoint(
 
     await manager.connect(ws)
     pubsub = rd_client.pubsub()
-    await pubsub.subscribe("rubaih:greeks", "rubaih:risk", "rubaih:ai", "rubaih:status")
+    await pubsub.subscribe("rubaih:greeks", "rubaih:risk", "rubaih:ai", "rubaih:status", "rubaih:log", "rubaih:scan")
 
     try:
         while True:

@@ -1,53 +1,81 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
   SafeAreaView, RefreshControl, Animated, Dimensions, StatusBar,
-  Alert, AppState, TextInput, Modal, Pressable,
+  Alert, AppState, TextInput, Modal, Switch,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { DEFAULT_API_HOST, DEFAULT_API_TOKEN, buildUrls, normalizeHost } from './config';
+import { DEFAULT_API_HOST, DEFAULT_API_TOKEN, buildUrls } from './config';
 
 const { width } = Dimensions.get('window');
 const STORAGE_KEY = 'rubaih.connection.v1';
+const THEME_KEY = 'rubaih.theme.v1';
 
-const COLORS = {
-  bg: '#0d1117',
-  card: '#161b22',
-  cardBorder: '#30363d',
-  gold: '#f0b90b',
-  goldDim: 'rgba(240, 185, 11, 0.15)',
-  cyan: '#00d4aa',
-  cyanDim: 'rgba(0, 212, 170, 0.15)',
-  purple: '#a855f7',
-  purpleDim: 'rgba(168, 85, 247, 0.15)',
-  red: '#ef4444',
-  redDim: 'rgba(239, 68, 68, 0.15)',
-  green: '#22c55e',
-  greenDim: 'rgba(34, 197, 94, 0.15)',
-  orange: '#f97316',
-  text: '#e6edf3',
-  textSecondary: '#8b949e',
-  textMuted: '#484f58',
-  inputBg: '#0d1117',
+const DARK = {
+  bg: '#0f1419',
+  card: '#1a222d',
+  border: '#2a3544',
+  text: '#f0f3f6',
+  muted: '#8b98a8',
+  faint: '#5a6878',
+  accent: '#c9a227',
+  accentDim: 'rgba(201,162,39,0.15)',
+  good: '#1db954',
+  goodDim: 'rgba(29,185,84,0.15)',
+  bad: '#e74c3c',
+  badDim: 'rgba(231,76,60,0.15)',
+  info: '#3b9eff',
+  infoDim: 'rgba(59,158,255,0.15)',
+  inputBg: '#121820',
+  logBg: '#0a0e12',
 };
+
+const LIGHT = {
+  bg: '#f4f6f8',
+  card: '#ffffff',
+  border: '#dce3ea',
+  text: '#1a2330',
+  muted: '#5c6b7a',
+  faint: '#8a97a5',
+  accent: '#b8860b',
+  accentDim: 'rgba(184,134,11,0.12)',
+  good: '#0d8a3f',
+  goodDim: 'rgba(13,138,63,0.12)',
+  bad: '#c0392b',
+  badDim: 'rgba(192,57,43,0.12)',
+  info: '#1a73e8',
+  infoDim: 'rgba(26,115,232,0.12)',
+  inputBg: '#ffffff',
+  logBg: '#eef2f6',
+};
+
+const TABS = [
+  { id: 'dashboard', label: 'Home' },
+  { id: 'coins', label: 'Coins' },
+  { id: 'logs', label: 'Logs' },
+  { id: 'trades', label: 'Trades' },
+  { id: 'settings', label: 'Setup' },
+];
 
 export default function App() {
   const [ready, setReady] = useState(false);
+  const [dark, setDark] = useState(true);
+  const C = dark ? DARK : LIGHT;
+
   const [hostInput, setHostInput] = useState(DEFAULT_API_HOST);
   const [tokenInput, setTokenInput] = useState(DEFAULT_API_TOKEN);
   const [conn, setConn] = useState(() => buildUrls(DEFAULT_API_HOST, DEFAULT_API_TOKEN));
 
   const [dashboard, setDashboard] = useState(null);
   const [history, setHistory] = useState([]);
-  const [aiDecisions, setAiDecisions] = useState([]);
   const [settings, setSettings] = useState(null);
+  const [scanPairs, setScanPairs] = useState([]);
+  const [logs, setLogs] = useState([]);
   const [connected, setConnected] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [activeTab, setActiveTab] = useState('settings');
   const [saving, setSaving] = useState(false);
   const [editOpen, setEditOpen] = useState(true);
-  const hostRef = useRef(null);
-  const tokenRef = useRef(null);
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const wsRef = useRef(null);
@@ -60,15 +88,17 @@ export default function App() {
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 1.3, duration: 800, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1.25, duration: 900, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 900, useNativeDriver: true }),
       ])
     ).start();
-  }, []);
+  }, [pulseAnim]);
 
   useEffect(() => {
     (async () => {
       try {
+        const theme = await AsyncStorage.getItem(THEME_KEY);
+        if (theme === 'light') setDark(false);
         const raw = await AsyncStorage.getItem(STORAGE_KEY);
         if (raw) {
           const saved = JSON.parse(raw);
@@ -76,66 +106,61 @@ export default function App() {
           setHostInput(next.apiHost || DEFAULT_API_HOST);
           setTokenInput(next.apiToken || DEFAULT_API_TOKEN);
           setConn(next);
-          if (!next.configured) {
-            setActiveTab('settings');
-            setEditOpen(true);
-          } else {
+          if (next.configured) {
             setActiveTab('dashboard');
             setEditOpen(false);
           }
-        } else {
-          setActiveTab('settings');
-          setEditOpen(true);
         }
       } catch (e) {
         console.error(e);
-        setActiveTab('settings');
-        setEditOpen(true);
       } finally {
         setReady(true);
       }
     })();
   }, []);
 
+  const toggleTheme = async () => {
+    const next = !dark;
+    setDark(next);
+    await AsyncStorage.setItem(THEME_KEY, next ? 'dark' : 'light');
+  };
+
   const apiFetch = useCallback(async (path, options = {}) => {
     const c = connRef.current;
-    if (!c.configured) throw new Error('Set VPS IP and API token in Settings first');
+    if (!c.configured) throw new Error('Set VPS IP and API token in Setup first');
     const res = await fetch(`${c.apiUrl}${path}`, {
       ...options,
       headers: { ...c.authHeaders, ...(options.headers || {}) },
     });
-    if (res.status === 401) throw new Error('Unauthorized — API token does not match server RUBAIH_API_TOKEN');
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || `HTTP ${res.status}`);
-    }
+    if (res.status === 401) throw new Error('Unauthorized — bad API token');
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
     return res.json();
   }, []);
 
   const fetchDashboard = useCallback(async () => {
     try { setDashboard(await apiFetch('/dashboard')); } catch (e) { console.error(e); }
   }, [apiFetch]);
-
   const fetchHistory = useCallback(async () => {
-    try { setHistory(await apiFetch('/hedge-history?limit=10')); } catch (e) { console.error(e); }
+    try { setHistory(await apiFetch('/hedge-history?limit=20')); } catch (e) { console.error(e); }
   }, [apiFetch]);
-
-  const fetchAiDecisions = useCallback(async () => {
-    try { setAiDecisions(await apiFetch('/ai-decisions?limit=10')); } catch (e) { console.error(e); }
-  }, [apiFetch]);
-
   const fetchSettings = useCallback(async () => {
     try { setSettings(await apiFetch('/settings')); } catch (e) { console.error(e); }
+  }, [apiFetch]);
+  const fetchScan = useCallback(async () => {
+    try {
+      const data = await apiFetch('/scan');
+      setScanPairs(data.pairs || []);
+    } catch (e) { console.error(e); }
+  }, [apiFetch]);
+  const fetchLogs = useCallback(async () => {
+    try { setLogs(await apiFetch('/logs?limit=100')); } catch (e) { console.error(e); }
   }, [apiFetch]);
 
   const connectWs = useCallback(() => {
     if (!aliveRef.current) return;
     const c = connRef.current;
     if (!c.configured) return;
-
-    if (wsRef.current) {
-      try { wsRef.current.close(); } catch (_) {}
-    }
+    if (wsRef.current) { try { wsRef.current.close(); } catch (_) {} }
     const ws = new WebSocket(c.wsUrl);
     wsRef.current = ws;
     ws.onopen = () => setConnected(true);
@@ -156,23 +181,25 @@ export default function App() {
           if (posSize != null && Number(posSize) > 0) {
             delta = posSide === 'short' ? -Number(posSize) : Number(posSize);
           }
-          setDashboard(prev => ({
+          setDashboard((prev) => ({
             ...(prev || {}),
             delta,
-            gamma: 0,
-            vega: 0,
-            theta: 0,
             spot_price: msg.data.spot,
             session_pnl: msg.data.session_pnl ?? prev?.session_pnl,
             active_pair: msg.data.active_pair || prev?.active_pair,
             position_size: posSize != null ? Number(posSize) : (prev?.position_size ?? 0),
             position_side: posSide || prev?.position_side || 'flat',
-            timestamp: new Date(msg.data.timestamp * 1000).toISOString(),
             status: prev?.status || 'running',
           }));
         }
         if (msg.channel === 'rubaih:status' && msg.data?.status) {
-          setDashboard(prev => prev ? { ...prev, status: msg.data.status } : prev);
+          setDashboard((prev) => (prev ? { ...prev, status: msg.data.status } : prev));
+        }
+        if (msg.channel === 'rubaih:scan' && Array.isArray(msg.data?.pairs)) {
+          setScanPairs(msg.data.pairs);
+        }
+        if (msg.channel === 'rubaih:log' && msg.data?.line) {
+          setLogs((prev) => [{ ts: msg.data.ts, line: msg.data.line }, ...prev].slice(0, 120));
         }
       } catch (err) {
         console.error(err);
@@ -182,27 +209,25 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     if (!connRef.current.configured) return;
-    await Promise.all([fetchDashboard(), fetchHistory(), fetchAiDecisions(), fetchSettings()]);
-  }, [fetchDashboard, fetchHistory, fetchAiDecisions, fetchSettings]);
+    await Promise.all([fetchDashboard(), fetchHistory(), fetchSettings(), fetchScan(), fetchLogs()]);
+  }, [fetchDashboard, fetchHistory, fetchSettings, fetchScan, fetchLogs]);
 
   useEffect(() => {
     if (!ready) return;
     aliveRef.current = true;
     clearTimeout(reconnectTimer.current);
-    if (wsRef.current) {
-      try { wsRef.current.close(); } catch (_) {}
-    }
+    if (wsRef.current) { try { wsRef.current.close(); } catch (_) {} }
     setConnected(false);
-
     if (!conn.configured) return undefined;
-
     refreshAll();
-    const interval = setInterval(fetchDashboard, 5000);
+    const interval = setInterval(() => {
+      fetchDashboard();
+      fetchScan();
+    }, 5000);
     connectWs();
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') connectWs();
     });
-
     return () => {
       aliveRef.current = false;
       clearInterval(interval);
@@ -210,30 +235,27 @@ export default function App() {
       sub.remove();
       if (wsRef.current) wsRef.current.close();
     };
-  }, [ready, conn.apiHost, conn.apiToken, conn.configured, refreshAll, fetchDashboard, connectWs]);
+  }, [ready, conn.apiHost, conn.apiToken, conn.configured, refreshAll, fetchDashboard, fetchScan, connectWs]);
 
   const saveConnection = async () => {
     setSaving(true);
     try {
       const next = buildUrls(hostInput, tokenInput);
       if (!next.apiHost || next.apiHost.includes('YOUR_VPS_IP')) {
-        Alert.alert('VPS IP required', 'Enter your VPS public IP, e.g. 12.34.56.78');
+        Alert.alert('VPS IP required', 'Example: 12.34.56.78:8080');
         return;
       }
       if (!next.apiToken || next.apiToken.includes('YOUR_RUBAIH')) {
-        Alert.alert('API token required', 'Paste RUBAIH_API_TOKEN from your VPS .env file');
+        Alert.alert('API token required', 'Paste RUBAIH_API_TOKEN from VPS .env');
         return;
       }
-      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({
-        host: next.apiHost,
-        token: next.apiToken,
-      }));
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ host: next.apiHost, token: next.apiToken }));
       setHostInput(next.apiHost);
       setTokenInput(next.apiToken);
       setConn(next);
       setEditOpen(false);
-      Alert.alert('Saved', `Connecting via nginx:\n${next.apiHost}\n\nUse host:port of nginx (often :8080). Do not use :8000/:8010.`);
       setActiveTab('dashboard');
+      Alert.alert('Saved', `Using ${next.apiHost}`);
     } catch (e) {
       Alert.alert('Save failed', String(e.message || e));
     } finally {
@@ -244,52 +266,31 @@ export default function App() {
   const testConnection = async () => {
     try {
       const next = buildUrls(hostInput, tokenInput);
-      const url = `${next.apiUrl}/health`;
-      const res = await fetch(url);
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        Alert.alert(
-          'Cannot reach VPS',
-          `Got HTML/non-JSON from:\n${url}\n\nHTTP ${res.status}\nBody starts: ${text.slice(0, 80)}\n\nOn VPS run:\ndocker compose ps\ncurl -sS http://127.0.0.1:8080/api/health`
-        );
-        return;
-      }
-      Alert.alert(
-        res.ok ? 'Reachable' : 'Error',
-        `Health: ${data.status}\nDB: ${String(data.db)}\nRedis: ${String(data.redis)}\nLive: ${String(data.live_trading)}`
-      );
+      const res = await fetch(`${next.apiUrl}/health`);
+      const data = await res.json();
+      Alert.alert(res.ok ? 'OK' : 'Error', `status=${data.status} db=${data.db} redis=${data.redis}`);
     } catch (e) {
-      Alert.alert(
-        'Cannot reach VPS',
-        `${String(e.message || e)}\n\nCheck:\n1) nginx up on host port 8080\n2) firewall allows 8080\n3) host is IP:8080 — not :8000`
-      );
+      Alert.alert('Cannot reach VPS', String(e.message || e));
     }
   };
 
   const triggerKillSwitch = () => {
-    Alert.alert(
-      'EMERGENCY KILL SWITCH',
-      'This will halt the bot and attempt to flatten delta on CoinDCX. Continue?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'HALT NOW',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              const data = await apiFetch('/kill-switch', { method: 'POST' });
-              Alert.alert('Sent', data.message || 'Kill switch triggered');
-              fetchDashboard();
-            } catch (e) {
-              Alert.alert('Failed', String(e.message || e));
-            }
-          },
+    Alert.alert('Kill switch', 'Halt bot and flatten?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'HALT',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            const data = await apiFetch('/kill-switch', { method: 'POST' });
+            Alert.alert('Sent', data.message || 'Triggered');
+            fetchDashboard();
+          } catch (e) {
+            Alert.alert('Failed', String(e.message || e));
+          }
         },
-      ]
-    );
+      },
+    ]);
   };
 
   const onRefresh = async () => {
@@ -298,504 +299,326 @@ export default function App() {
     setRefreshing(false);
   };
 
-  const formatNumber = (n, digits = 4) => {
+  const fmtInr = (n) => {
     if (n === undefined || n === null) return '—';
-    return typeof n === 'number' ? n.toFixed(digits) : n;
+    return '₹' + Number(n).toLocaleString('en-IN', { maximumFractionDigits: 0 });
   };
+  const fmtUsdt = (n) => {
+    if (n === undefined || n === null) return '—';
+    return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+  const fmtNum = (n, d = 4) => (n == null ? '—' : Number(n).toFixed(d));
 
-  // Futures marks are USDT-quoted; account capital / session PnL shown as INR.
-  const formatInr = (n) => {
-    if (n === undefined || n === null) return '—';
-    return '₹' + Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  };
-  const formatUsdt = (n) => {
-    if (n === undefined || n === null) return '—';
-    return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USDT';
-  };
-
-  const activePair = dashboard?.active_pair || settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT';
+  const activePair = dashboard?.active_pair || settings?.active_pair || 'B-BTC_USDT';
   const pairBase = String(activePair).replace(/^B-/i, '').replace(/^I-/i, '').split('_')[0] || 'BTC';
-  const pairUnit = ` ${pairBase}`;
+  const posSize = dashboard?.position_size > 0 ? dashboard.position_size : Math.abs(dashboard?.delta || 0);
+  const isLong = dashboard?.position_side === 'long' || (dashboard?.delta || 0) > 0.00005;
+  const isShort = dashboard?.position_side === 'short' || (dashboard?.delta || 0) < -0.00005;
+  const isFlat = !isLong && !isShort;
 
-  const fmtSetting = (v, suffix = '') => {
-    if (v === undefined || v === null) return '—';
-    if (typeof v === 'boolean') return v ? 'ON' : 'OFF';
-    if (typeof v === 'number') return `${v}${suffix}`;
-    return String(v);
-  };
+  const styles = useMemo(() => makeStyles(C), [C]);
 
   if (!ready) {
     return (
-      <SafeAreaView style={styles.container}>
-        <Text style={[styles.empty, { marginTop: 80 }]}>Loading…</Text>
+      <SafeAreaView style={[styles.root, { justifyContent: 'center', alignItems: 'center' }]}>
+        <Text style={{ color: C.muted }}>Loading…</Text>
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+    <SafeAreaView style={styles.root}>
+      <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={C.bg} />
 
       <View style={styles.header}>
-        <View style={styles.headerLeft}>
-          <Text style={styles.headerTitle}>Rubaih</Text>
-          <Text style={styles.headerSubtitle}>CoinDCX · INR-M Futures Hedge</Text>
+        <View>
+          <Text style={styles.brand}>Rubaih</Text>
+          <Text style={styles.sub}>CoinDCX · auto buy / sell</Text>
         </View>
         <View style={styles.headerRight}>
-          <Animated.View style={[styles.pulseDot, { transform: [{ scale: pulseAnim }] }]}>
-            <View style={[styles.statusDot, { backgroundColor: connected ? COLORS.green : COLORS.red }]} />
+          <TouchableOpacity onPress={toggleTheme} style={styles.themeBtn}>
+            <Text style={styles.themeBtnText}>{dark ? 'Light' : 'Dark'}</Text>
+          </TouchableOpacity>
+          <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+            <View style={[styles.dot, { backgroundColor: connected ? C.good : C.bad }]} />
           </Animated.View>
-          <Text style={[styles.statusText, { color: connected ? COLORS.green : COLORS.red }]}>
-            {connected ? 'LIVE' : 'OFFLINE'}
+          <Text style={{ color: connected ? C.good : C.bad, fontWeight: '700', fontSize: 11 }}>
+            {connected ? 'ON' : 'OFF'}
           </Text>
         </View>
-      </View>
-
-      <View style={styles.tabBar}>
-        {['dashboard', 'hedges', 'ai', 'settings'].map(tab => (
-          <TouchableOpacity
-            key={tab}
-            style={[styles.tab, activeTab === tab && styles.tabActive]}
-            onPress={() => setActiveTab(tab)}
-          >
-            <Text style={[styles.tabText, activeTab === tab && styles.tabTextActive]}>
-              {tab === 'dashboard' ? 'Dashboard' : tab === 'hedges' ? 'Hedges' : tab === 'ai' ? 'AI' : 'Settings'}
-            </Text>
-          </TouchableOpacity>
-        ))}
       </View>
 
       <ScrollView
-        style={styles.scroll}
-        keyboardShouldPersistTaps="always"
-        nestedScrollEnabled
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.gold} />}
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.tabScroll}
+        contentContainerStyle={styles.tabRow}
       >
-          {activeTab === 'dashboard' && (
-            <>
-              {!conn.configured && (
-                <TouchableOpacity style={styles.warnCard} onPress={() => { setActiveTab('settings'); setEditOpen(true); }}>
-                  <Text style={styles.warnTitle}>Connection not set</Text>
-                  <Text style={styles.warnBody}>Tap here → enter VPS IP + API token → Save</Text>
-                </TouchableOpacity>
-              )}
+        {TABS.map((t) => (
+          <TouchableOpacity
+            key={t.id}
+            style={[styles.tab, activeTab === t.id && styles.tabOn]}
+            onPress={() => setActiveTab(t.id)}
+          >
+            <Text style={[styles.tabText, activeTab === t.id && styles.tabTextOn]}>{t.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
 
-              <TouchableOpacity style={styles.killButton} onPress={triggerKillSwitch} activeOpacity={0.7}>
-                <View style={styles.killButtonInner}>
-                  <Text style={styles.killButtonText}>EMERGENCY KILL SWITCH</Text>
-                  <Text style={styles.killButtonSub}>Confirm required · flattens and halts</Text>
-                </View>
+      <ScrollView
+        style={styles.body}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.accent} />}
+        keyboardShouldPersistTaps="always"
+      >
+        {activeTab === 'dashboard' && (
+          <>
+            {!conn.configured && (
+              <TouchableOpacity style={styles.warn} onPress={() => { setActiveTab('settings'); setEditOpen(true); }}>
+                <Text style={styles.warnTitle}>Connect your VPS</Text>
+                <Text style={styles.warnBody}>Open Setup → enter IP:8080 + token</Text>
               </TouchableOpacity>
+            )}
 
-              {dashboard && (
-                <View style={styles.heroCard}>
-                  <Text style={styles.heroLabel}>{pairBase} Mark</Text>
-                  <Text style={styles.heroPair}>{activePair}</Text>
-                  <Text style={styles.heroPrice}>{formatUsdt(dashboard.spot_price)}</Text>
-                  <Text style={styles.pnlLine}>Session PnL: {formatInr(dashboard.session_pnl)}</Text>
-                  <View style={styles.heroRow}>
-                    <View style={[styles.badge, {
-                      backgroundColor: dashboard.live_trading ? COLORS.redDim : COLORS.cyanDim,
-                      borderColor: dashboard.live_trading ? COLORS.red : COLORS.cyan,
-                    }]}>
-                      <Text style={[styles.badgeText, { color: dashboard.live_trading ? COLORS.red : COLORS.cyan }]}>
-                        {dashboard.live_trading ? 'LIVE' : 'DRY-RUN'}
-                      </Text>
-                    </View>
-                    <View style={[styles.badge, { backgroundColor: COLORS.cyanDim, borderColor: COLORS.cyan }]}>
-                      <Text style={[styles.badgeText, { color: COLORS.cyan }]}>
-                        {(dashboard.status || '').toUpperCase()}
-                      </Text>
-                    </View>
-                  </View>
-                </View>
-              )}
+            <TouchableOpacity style={styles.kill} onPress={triggerKillSwitch}>
+              <Text style={styles.killText}>EMERGENCY STOP</Text>
+            </TouchableOpacity>
 
-              {dashboard && (
-                <View style={styles.greeksGrid}>
-                  <GreekCard
-                    label="Position"
-                    value={formatNumber(
-                      dashboard.position_size > 0 ? dashboard.position_size : Math.abs(dashboard.delta || 0),
-                      4
-                    )}
-                    unit={pairUnit}
-                    color={
-                      (dashboard.position_size > 0 || Math.abs(dashboard.delta) > 0.0001)
-                        ? COLORS.gold
-                        : COLORS.green
-                    }
-                  />
-                  <GreekCard
-                    label="Side"
-                    value={
-                      dashboard.position_side && dashboard.position_side !== 'flat'
-                        ? dashboard.position_side.toUpperCase()
-                        : Math.abs(dashboard.delta || 0) < 0.00005
-                          ? 'FLAT'
-                          : dashboard.delta > 0
-                            ? 'LONG'
-                            : 'SHORT'
-                    }
-                    color={
-                      (dashboard.position_side === 'long' || dashboard.delta > 0.00005)
-                        ? COLORS.cyan
-                        : (dashboard.position_side === 'short' || dashboard.delta < -0.00005)
-                          ? COLORS.red
-                          : COLORS.green
-                    }
-                  />
-                  <GreekCard
-                    label="Pair"
-                    value={pairBase}
-                    color={COLORS.gold}
-                  />
-                  <GreekCard
-                    label="Trades 24h"
-                    value={String(dashboard.num_positions ?? 0)}
-                    color={COLORS.purple}
-                  />
-                </View>
-              )}
-
-              {dashboard && (dashboard.position_size > 0 || Math.abs(dashboard.delta || 0) >= 0.00005) ? null : (
-                <View style={styles.infoCard}>
-                  <Text style={styles.infoTitle}>Flat — scanning</Text>
-                  <Text style={styles.infoBody}>
-                    Looking across majors + alts for momentum.{"\n"}
-                    Target ~₹{fmtSetting(settings?.target_margin_inr || 2000)} margin per buy @ {fmtSetting(settings?.leverage || 10)}x.
-                  </Text>
-                </View>
-              )}
-
-              {dashboard?.ai_last_action && (
-                <View style={styles.aiCard}>
-                  <Text style={styles.aiCardTitle}>Latest AI</Text>
-                  <View style={styles.aiCardRow}>
-                    <View style={[styles.aiActionPill, { backgroundColor: getActionStyle(dashboard.ai_last_action).bg }]}>
-                      <Text style={[styles.aiActionPillText, { color: getActionStyle(dashboard.ai_last_action).fg }]}>
-                        {String(dashboard.ai_last_action).toUpperCase()}
-                      </Text>
-                    </View>
-                    <Text style={styles.confidencePlain}>
-                      {((dashboard.ai_confidence || 0) * 100).toFixed(0)}% conf
-                    </Text>
-                  </View>
-                </View>
-              )}
-            </>
-          )}
-
-          {activeTab === 'hedges' && (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Recent Trades</Text>
-              {history.length === 0 && <Text style={styles.empty}>No trades yet</Text>}
-              {history.map((h, i) => (
-                <View key={h.id} style={[styles.tradeRow, i === 0 && styles.tradeRowFirst]}>
-                  <View style={[styles.tradeSideBadge, { backgroundColor: h.side === 'buy' ? COLORS.greenDim : COLORS.redDim }]}>
-                    <Text style={[styles.tradeSideText, { color: h.side === 'buy' ? COLORS.green : COLORS.red }]}>
+              <Text style={styles.label}>{pairBase} mark</Text>
+              <Text style={styles.price}>{fmtUsdt(dashboard?.spot_price)} USDT</Text>
+              <Text style={styles.pairId}>{activePair}</Text>
+              <View style={styles.row}>
+                <Pill C={C} text={dashboard?.live_trading ? 'LIVE' : 'DRY-RUN'} tone={dashboard?.live_trading ? 'bad' : 'info'} />
+                <Pill C={C} text={(dashboard?.status || '—').toUpperCase()} tone="accent" />
+              </View>
+            </View>
+
+            <View style={styles.grid}>
+              <Stat C={C} label="Side" value={isFlat ? 'FLAT' : isLong ? 'LONG' : 'SHORT'} color={isFlat ? C.good : isLong ? C.info : C.bad} />
+              <Stat C={C} label="Size" value={`${fmtNum(posSize)}${isFlat ? '' : ` ${pairBase}`}`} color={C.accent} />
+              <Stat C={C} label="Session PnL" value={fmtInr(dashboard?.session_pnl)} color={(dashboard?.session_pnl || 0) >= 0 ? C.good : C.bad} />
+              <Stat C={C} label="Trades 24h" value={String(dashboard?.num_positions ?? 0)} color={C.text} />
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>How exits work</Text>
+              <Text style={styles.help}>
+                Buys best momentum coin (~₹{settings?.target_margin_inr || 2000} margin).{"\n"}
+                Sells on take-profit, stop-loss, or if profit peaks then drops ₹{settings?.profit_trail_giveback_inr || 50} (trail lock).
+              </Text>
+            </View>
+          </>
+        )}
+
+        {activeTab === 'coins' && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Scanner list ({scanPairs.length})</Text>
+            <Text style={styles.help}>Sorted by short momentum. Active pair highlighted.</Text>
+            {scanPairs.length === 0 && <Text style={styles.empty}>Waiting for scan data…</Text>}
+            {scanPairs.map((p) => (
+              <View key={p.pair} style={[styles.coinRow, p.active && { backgroundColor: C.accentDim }]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.coinBase}>{p.base || p.pair}</Text>
+                  <Text style={styles.coinPair}>{p.pair}</Text>
+                </View>
+                <Text style={styles.coinMid}>{p.mid ? fmtUsdt(p.mid) : '—'}</Text>
+                <Text style={[styles.coinMove, {
+                  color: p.move_pct == null ? C.faint : p.move_pct >= 0 ? C.good : C.bad,
+                }]}>
+                  {p.move_pct == null ? '…' : `${p.move_pct >= 0 ? '+' : ''}${p.move_pct.toFixed(2)}%`}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {activeTab === 'logs' && (
+          <View style={[styles.card, { backgroundColor: C.logBg }]}>
+            <Text style={styles.cardTitle}>Live engine logs</Text>
+            {logs.length === 0 && <Text style={styles.empty}>No logs yet — wait for SCAN / CYCLE lines</Text>}
+            {logs.map((l, i) => (
+              <Text key={`${l.ts}-${i}`} style={styles.logLine} selectable>
+                {l.line}
+              </Text>
+            ))}
+          </View>
+        )}
+
+        {activeTab === 'trades' && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Recent buys / sells</Text>
+            {history.length === 0 && <Text style={styles.empty}>No trades yet</Text>}
+            {history.map((h) => {
+              const base = (h.symbol || '').replace(/^B-/, '').split('_')[0] || '—';
+              const buy = h.side === 'buy';
+              return (
+                <View key={h.id} style={styles.tradeRow}>
+                  <View style={[styles.sideBadge, { backgroundColor: buy ? C.goodDim : C.badDim }]}>
+                    <Text style={{ color: buy ? C.good : C.bad, fontWeight: '800', fontSize: 11 }}>
                       {h.side.toUpperCase()}
                     </Text>
                   </View>
-                  <Text style={styles.tradeSize}>{Number(h.size).toFixed(4)} {(h.symbol || '').replace(/^B-/, '').split('_')[0] || pairBase}</Text>
-                  <Text style={styles.tradePrice}>{formatUsdt(h.price)}</Text>
-                  {h.ai_augmented ? <Text style={styles.aiBadge}>AI</Text> : null}
+                  <Text style={styles.tradeSize}>{fmtNum(h.size)} {base}</Text>
+                  <Text style={styles.tradePx}>{fmtUsdt(h.price)}</Text>
                 </View>
-              ))}
-            </View>
-          )}
+              );
+            })}
+          </View>
+        )}
 
-          {activeTab === 'ai' && (
+        {activeTab === 'settings' && (
+          <>
             <View style={styles.card}>
-              <Text style={[styles.cardTitle, { color: COLORS.gold }]}>AI Decisions</Text>
-              {aiDecisions.length === 0 && <Text style={styles.empty}>No AI decisions yet</Text>}
-              {aiDecisions.map((d, i) => {
-                const st = getActionStyle(d.action);
-                return (
-                  <View key={d.id} style={[styles.aiDecisionRow, i === 0 && styles.tradeRowFirst]}>
-                    <View style={styles.aiDecisionLeft}>
-                      <View style={[styles.aiActionPill, { backgroundColor: st.bg, alignSelf: 'flex-start' }]}>
-                        <Text style={[styles.aiActionPillText, { color: st.fg }]}>{String(d.action).toUpperCase()}</Text>
-                      </View>
-                      <Text style={styles.aiDecisionModel}>{(d.model || '').split('/').pop()}</Text>
-                    </View>
-                    <View style={styles.aiDecisionRight}>
-                      <Text style={styles.confidencePlain}>{(d.confidence * 100).toFixed(0)}%</Text>
-                      <Text style={styles.aiDecisionRisk}>{d.risk_assessment}</Text>
-                    </View>
-                  </View>
-                );
-              })}
+              <Text style={styles.cardTitle}>Connection</Text>
+              <Text style={styles.help}>Host example: 12.34.56.78:8080</Text>
+              <Row C={C} label="Host" value={(conn.apiHost || '').replace(/^https?:\/\//, '') || 'not set'} />
+              <Row C={C} label="Token" value={conn.configured ? 'set' : 'missing'} />
+              <View style={styles.themeRow}>
+                <Text style={{ color: C.text, fontWeight: '600' }}>Dark mode</Text>
+                <Switch value={dark} onValueChange={toggleTheme} trackColor={{ true: C.accent, false: C.border }} />
+              </View>
+              <TouchableOpacity style={styles.primaryBtn} onPress={() => setEditOpen(true)}>
+                <Text style={styles.primaryBtnText}>Edit connection</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.secondaryBtn} onPress={testConnection}>
+                <Text style={[styles.secondaryBtnText, { color: C.info }]}>Test health</Text>
+              </TouchableOpacity>
             </View>
-          )}
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Bot (from server)</Text>
+              <Row C={C} label="Capital" value={`${settings?.capital_inr ?? '—'} INR`} />
+              <Row C={C} label="Target margin" value={`${settings?.target_margin_inr ?? 2000} INR`} />
+              <Row C={C} label="Leverage" value={`${settings?.leverage ?? '—'}x`} />
+              <Row C={C} label="Active pair" value={settings?.active_pair || '—'} />
+              <Row C={C} label="Live trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
+            </View>
+          </>
+        )}
+      </ScrollView>
 
-          {activeTab === 'settings' && (
-            <>
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Server connection</Text>
-                <Text style={styles.help}>
-                  Tap Edit Connection to type your VPS host and API token.{"\n"}
-                  Because port 80 is often busy, use: YOUR_IP:8080{"\n"}
-                  Example: 12.34.56.78:8080
-                </Text>
-                <SettingsRow label="Current host" value={(conn.apiHost || '').replace(/^https?:\/\//, '') || 'not set'} />
-                <SettingsRow label="Token set" value={conn.configured ? 'yes' : 'no'} />
-                <TouchableOpacity style={styles.saveBtn} onPress={() => setEditOpen(true)}>
-                  <Text style={styles.saveBtnText}>Edit Connection</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.testBtn} onPress={testConnection}>
-                  <Text style={styles.testBtnText}>Test /api/health</Text>
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Bot Settings (from server · read-only)</Text>
-                <SettingsRow label="Mode" value={fmtSetting(settings?.mode || 'futures_cycle')} />
-                <SettingsRow label="Capital" value={fmtSetting(settings?.capital_inr, ' INR')} />
-                <SettingsRow label="Target margin" value={fmtSetting(settings?.target_margin_inr || 2000, ' INR')} />
-                <SettingsRow label="Margin" value={fmtSetting(settings?.margin_currency || 'INR')} />
-                <SettingsRow label="Leverage" value={fmtSetting(settings?.leverage, 'x')} />
-                <SettingsRow label="Exchange" value="CoinDCX" />
-                <SettingsRow label="Active pair" value={fmtSetting(settings?.active_pair || settings?.perp_symbol || 'B-BTC_USDT')} />
-                <SettingsRow label="Scan pairs" value={fmtSetting(settings?.scan_pairs || '—')} />
-                <SettingsRow label="Live Trading" value={dashboard?.live_trading ? 'ON' : 'OFF'} />
-              </View>
-            </>
-          )}
-        </ScrollView>
-
-      <Modal
-        visible={editOpen}
-        animationType="slide"
-        transparent={false}
-        onRequestClose={() => { if (conn.configured) setEditOpen(false); }}
-        onShow={() => { setTimeout(() => hostRef.current?.focus?.(), 300); }}
-      >
-        <SafeAreaView style={styles.modalRoot}>
-          <Text style={styles.modalTitle}>Edit Connection</Text>
-          <Text style={styles.help}>
-            Example host: 12.34.56.78:8080{"\n"}
-            Token: copy RUBAIH_API_TOKEN from VPS .env{"\n"}
-            (nginx listens on 8080 — not bare port 80 / 8000)
-          </Text>
-
-          <Text style={styles.inputLabel}>VPS IP or host</Text>
+      <Modal visible={editOpen} animationType="slide" onRequestClose={() => { if (conn.configured) setEditOpen(false); }}>
+        <SafeAreaView style={[styles.root, { padding: 20 }]}>
+          <Text style={[styles.brand, { marginBottom: 12 }]}>Edit connection</Text>
+          <Text style={styles.help}>IP:8080 + RUBAIH_API_TOKEN from VPS .env</Text>
+          <Text style={styles.inputLabel}>Host</Text>
           <TextInput
-            ref={hostRef}
             style={styles.input}
             value={hostInput}
             onChangeText={setHostInput}
-            placeholder="12.34.56.78:8080"
-            placeholderTextColor={COLORS.textMuted}
             autoCapitalize="none"
             autoCorrect={false}
-            editable
-            showSoftInputOnFocus
-            selectTextOnFocus
-            keyboardType="default"
-            returnKeyType="next"
-            onSubmitEditing={() => tokenRef.current?.focus?.()}
-            blurOnSubmit={false}
+            placeholder="12.34.56.78:8080"
+            placeholderTextColor={C.faint}
           />
-
           <Text style={styles.inputLabel}>API token</Text>
           <TextInput
-            ref={tokenRef}
             style={styles.input}
             value={tokenInput}
             onChangeText={setTokenInput}
-            placeholder="paste RUBAIH_API_TOKEN"
-            placeholderTextColor={COLORS.textMuted}
             autoCapitalize="none"
             autoCorrect={false}
-            editable
-            showSoftInputOnFocus
-            selectTextOnFocus
-            keyboardType="default"
-            returnKeyType="done"
+            secureTextEntry
+            placeholder="token"
+            placeholderTextColor={C.faint}
           />
-
-          <Text style={styles.preview}>Will call: {normalizeHost(hostInput) || '—'}/api</Text>
-
-          <TouchableOpacity style={styles.saveBtn} onPress={saveConnection} disabled={saving}>
-            <Text style={styles.saveBtnText}>{saving ? 'Saving…' : 'Save & Connect'}</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={saveConnection} disabled={saving}>
+            <Text style={styles.primaryBtnText}>{saving ? 'Saving…' : 'Save'}</Text>
           </TouchableOpacity>
-
-          {conn.configured ? (
-            <Pressable onPress={() => setEditOpen(false)} style={{ padding: 16, alignItems: 'center' }}>
-              <Text style={{ color: COLORS.textSecondary }}>Cancel</Text>
-            </Pressable>
-          ) : null}
+          {conn.configured && (
+            <TouchableOpacity onPress={() => setEditOpen(false)} style={{ marginTop: 16, alignItems: 'center' }}>
+              <Text style={{ color: C.muted }}>Cancel</Text>
+            </TouchableOpacity>
+          )}
         </SafeAreaView>
       </Modal>
     </SafeAreaView>
   );
 }
 
-function GreekCard({ label, value, unit = '', color, icon }) {
+function Pill({ C, text, tone }) {
+  const map = { bad: C.bad, good: C.good, info: C.info, accent: C.accent };
+  const color = map[tone] || C.muted;
   return (
-    <View style={[styles.greekCard, { borderColor: color + '66' }]}>
-      {icon ? (
-        <View style={[styles.greekIconBox, { backgroundColor: color + '22' }]}>
-          <Text style={[styles.greekIcon, { color }]}>{icon}</Text>
-        </View>
-      ) : null}
-      <Text style={styles.greekLabel}>{label}</Text>
-      <Text style={[styles.greekValue, { color }]}>
-        {value}
-        {unit ? <Text style={{ fontSize: 12, fontWeight: '500' }}>{unit}</Text> : null}
-      </Text>
+    <View style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, marginRight: 6, marginTop: 6 }}>
+      <Text style={{ color, fontSize: 10, fontWeight: '800' }}>{text}</Text>
     </View>
   );
 }
 
-function SettingsRow({ label, value }) {
+function Stat({ C, label, value, color }) {
   return (
-    <View style={styles.settingsRow}>
-      <Text style={styles.settingsLabel}>{label}</Text>
-      <Text style={styles.settingsValue}>{value}</Text>
+    <View style={{
+      width: (width - 48) / 2, backgroundColor: C.card, borderRadius: 14,
+      padding: 14, marginBottom: 12, borderWidth: 1, borderColor: C.border,
+    }}>
+      <Text style={{ color: C.muted, fontSize: 11, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.8 }}>{label}</Text>
+      <Text style={{ color: color || C.text, fontSize: 20, fontWeight: '700' }}>{value}</Text>
     </View>
   );
 }
 
-function getActionStyle(action) {
-  const a = String(action || '').toUpperCase();
-  if (a === 'HEDGE' || a === 'BUY' || a === 'ENTRY') return { bg: COLORS.cyan, fg: '#04140f' };
-  if (a === 'HOLD') return { bg: COLORS.green, fg: '#04140f' };
-  if (a === 'EMERGENCY' || a === 'SELL' || a === 'EXIT') return { bg: COLORS.red, fg: '#ffffff' };
-  if (a === 'ADJUST_THRESHOLD') return { bg: COLORS.orange, fg: '#04140f' };
-  return { bg: COLORS.gold, fg: '#04140f' };
+function Row({ C, label, value }) {
+  return (
+    <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border }}>
+      <Text style={{ color: C.muted, fontSize: 13 }}>{label}</Text>
+      <Text style={{ color: C.text, fontSize: 13, fontWeight: '600', maxWidth: '55%', textAlign: 'right' }}>{String(value)}</Text>
+    </View>
+  );
 }
 
-function getActionColor(action) {
-  return getActionStyle(action).bg;
+function makeStyles(C) {
+  return StyleSheet.create({
+    root: { flex: 1, backgroundColor: C.bg },
+    header: {
+      flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+      paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border,
+    },
+    brand: { fontSize: 22, fontWeight: '800', color: C.accent },
+    sub: { fontSize: 11, color: C.muted, marginTop: 2 },
+    headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+    themeBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, backgroundColor: C.accentDim, marginRight: 4 },
+    themeBtnText: { color: C.accent, fontWeight: '700', fontSize: 11 },
+    dot: { width: 8, height: 8, borderRadius: 4, marginRight: 4 },
+    tabScroll: { maxHeight: 52, borderBottomWidth: 1, borderBottomColor: C.border },
+    tabRow: { paddingHorizontal: 10, paddingVertical: 8, gap: 6 },
+    tab: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999, backgroundColor: C.card, borderWidth: 1, borderColor: C.border },
+    tabOn: { backgroundColor: C.accentDim, borderColor: C.accent },
+    tabText: { color: C.muted, fontWeight: '600', fontSize: 12 },
+    tabTextOn: { color: C.accent },
+    body: { flex: 1, padding: 16 },
+    warn: { backgroundColor: C.accentDim, borderColor: C.accent, borderWidth: 1, borderRadius: 12, padding: 14, marginBottom: 12 },
+    warnTitle: { color: C.accent, fontWeight: '700', marginBottom: 4 },
+    warnBody: { color: C.muted, fontSize: 12 },
+    kill: { backgroundColor: C.bad, borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginBottom: 14 },
+    killText: { color: '#fff', fontWeight: '800', letterSpacing: 1 },
+    card: { backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: C.border },
+    cardTitle: { fontSize: 15, fontWeight: '700', color: C.text, marginBottom: 8 },
+    label: { color: C.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 1.5, textAlign: 'center' },
+    price: { color: C.accent, fontSize: 34, fontWeight: '800', textAlign: 'center', marginVertical: 6 },
+    pairId: { color: C.faint, fontSize: 11, textAlign: 'center', marginBottom: 8 },
+    row: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center' },
+    grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
+    help: { color: C.muted, fontSize: 13, lineHeight: 20 },
+    empty: { color: C.faint, textAlign: 'center', paddingVertical: 20 },
+    coinRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderTopWidth: 1, borderTopColor: C.border, paddingHorizontal: 6, borderRadius: 8 },
+    coinBase: { color: C.text, fontWeight: '700', fontSize: 15 },
+    coinPair: { color: C.faint, fontSize: 10, marginTop: 2 },
+    coinMid: { color: C.muted, fontSize: 12, width: 90, textAlign: 'right', fontVariant: ['tabular-nums'] },
+    coinMove: { fontSize: 13, fontWeight: '700', width: 72, textAlign: 'right', fontVariant: ['tabular-nums'] },
+    logLine: { color: C.muted, fontSize: 11, fontFamily: 'monospace', marginBottom: 6, lineHeight: 16 },
+    tradeRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderTopWidth: 1, borderTopColor: C.border },
+    sideBadge: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 },
+    tradeSize: { color: C.text, fontSize: 13, flex: 1, fontVariant: ['tabular-nums'] },
+    tradePx: { color: C.muted, fontSize: 12, fontVariant: ['tabular-nums'] },
+    themeRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 12, marginBottom: 8 },
+    primaryBtn: { backgroundColor: C.accent, borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 8 },
+    primaryBtnText: { color: '#1a1400', fontWeight: '800' },
+    secondaryBtn: { borderWidth: 1, borderColor: C.info, borderRadius: 10, paddingVertical: 12, alignItems: 'center', marginTop: 10 },
+    secondaryBtnText: { fontWeight: '700' },
+    inputLabel: { color: C.faint, fontSize: 11, marginBottom: 6, marginTop: 8, textTransform: 'uppercase' },
+    input: {
+      backgroundColor: C.inputBg, borderWidth: 1, borderColor: C.accent, borderRadius: 10,
+      paddingHorizontal: 12, paddingVertical: 14, color: C.text, marginBottom: 8,
+    },
+  });
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLORS.bg },
-  header: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingHorizontal: 20, paddingTop: 16, paddingBottom: 12,
-    borderBottomWidth: 1, borderBottomColor: COLORS.cardBorder,
-  },
-  headerLeft: { flex: 1 },
-  headerTitle: { fontSize: 24, fontWeight: 'bold', color: COLORS.gold, letterSpacing: 0.5 },
-  headerSubtitle: { fontSize: 11, color: COLORS.textMuted, marginTop: 2 },
-  headerRight: { flexDirection: 'row', alignItems: 'center' },
-  pulseDot: { marginRight: 6 },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statusText: { fontSize: 11, fontWeight: '600' },
-  tabBar: {
-    flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 10,
-    borderBottomWidth: 1, borderBottomColor: COLORS.cardBorder,
-  },
-  tab: { flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 8 },
-  tabActive: { backgroundColor: COLORS.goldDim },
-  tabText: { fontSize: 11, color: COLORS.textSecondary, fontWeight: '500' },
-  tabTextActive: { color: COLORS.gold, fontWeight: '600' },
-  scroll: { flex: 1, paddingHorizontal: 16, paddingTop: 16 },
-  warnCard: {
-    backgroundColor: COLORS.orange + '22', borderColor: COLORS.orange, borderWidth: 1,
-    borderRadius: 12, padding: 14, marginBottom: 16,
-  },
-  warnTitle: { color: COLORS.orange, fontWeight: '700', marginBottom: 4 },
-  warnBody: { color: COLORS.textSecondary, fontSize: 12 },
-  infoCard: {
-    backgroundColor: COLORS.cyanDim,
-    borderColor: COLORS.cyan,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 16,
-  },
-  infoTitle: { color: COLORS.cyan, fontWeight: '700', marginBottom: 6, fontSize: 13 },
-  infoBody: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 18 },
-  killButton: { backgroundColor: COLORS.red, borderRadius: 16, marginBottom: 16 },
-  killButtonInner: { padding: 18, alignItems: 'center' },
-  killButtonText: { color: '#fff', fontSize: 16, fontWeight: 'bold', letterSpacing: 1 },
-  killButtonSub: { color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 2 },
-  heroCard: {
-    backgroundColor: COLORS.card, borderRadius: 16, padding: 20, marginBottom: 16,
-    borderWidth: 1, borderColor: COLORS.gold + '33', alignItems: 'center',
-  },
-  heroLabel: { fontSize: 12, color: COLORS.textSecondary, textTransform: 'uppercase', letterSpacing: 2 },
-  heroPair: { fontSize: 11, color: COLORS.textMuted, marginTop: 4, letterSpacing: 0.5 },
-  heroPrice: { fontSize: 36, fontWeight: 'bold', color: COLORS.gold, marginVertical: 8, fontVariant: ['tabular-nums'] },
-  pnlLine: { fontSize: 13, color: COLORS.textSecondary, marginBottom: 8, fontVariant: ['tabular-nums'] },
-  heroRow: { flexDirection: 'row', gap: 8, marginTop: 4, flexWrap: 'wrap', justifyContent: 'center' },
-  badge: { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 20, borderWidth: 1 },
-  badgeText: { fontSize: 10, fontWeight: '600' },
-  greeksGrid: {
-    flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 16,
-  },
-  greekCard: {
-    width: (width - 48) / 2, backgroundColor: COLORS.card, borderRadius: 14,
-    padding: 16, marginBottom: 12, borderWidth: 1, borderLeftWidth: 3,
-  },
-  greekIconBox: { width: 32, height: 32, borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginBottom: 8 },
-  greekIcon: { fontSize: 16, fontWeight: 'bold' },
-  greekLabel: { fontSize: 11, color: COLORS.textSecondary, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 },
-  greekValue: { fontSize: 18, fontWeight: 'bold', fontVariant: ['tabular-nums'] },
-  aiCard: {
-    backgroundColor: COLORS.card, borderRadius: 14, padding: 16, marginBottom: 16,
-    borderWidth: 1, borderLeftWidth: 3,
-  },
-  aiCardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
-  aiCardTitle: { fontSize: 14, fontWeight: '600', color: COLORS.textSecondary, marginBottom: 10 },
-  aiCardRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  aiAction: { fontSize: 20, fontWeight: 'bold' },
-  aiActionPill: { borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
-  aiActionPillText: { fontSize: 14, fontWeight: '800', letterSpacing: 0.5 },
-  confidencePlain: { color: COLORS.text, fontSize: 13, fontWeight: '600' },
-  confidenceBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 },
-  confidenceText: { fontSize: 11, fontWeight: '600' },
-  card: {
-    backgroundColor: COLORS.card, borderRadius: 14, padding: 16, marginBottom: 16,
-    borderWidth: 1, borderColor: COLORS.cardBorder,
-  },
-  cardTitle: { fontSize: 14, fontWeight: '600', color: COLORS.text, marginBottom: 12 },
-  help: { color: COLORS.textSecondary, fontSize: 12, lineHeight: 18, marginBottom: 14 },
-  inputLabel: { color: COLORS.textMuted, fontSize: 11, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 },
-  input: {
-    backgroundColor: COLORS.inputBg, borderWidth: 1, borderColor: COLORS.gold,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 14, color: COLORS.text,
-    marginBottom: 12, fontSize: 16, minHeight: 52,
-  },
-  preview: { color: COLORS.cyan, fontSize: 11, marginBottom: 14 },
-  saveBtn: {
-    backgroundColor: COLORS.gold, borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginBottom: 10,
-  },
-  saveBtnText: { color: '#0d1117', fontWeight: '700', fontSize: 14 },
-  testBtn: {
-    borderWidth: 1, borderColor: COLORS.cyan, borderRadius: 10, paddingVertical: 12, alignItems: 'center',
-  },
-  testBtnText: { color: COLORS.cyan, fontWeight: '600', fontSize: 13 },
-  modalRoot: { flex: 1, backgroundColor: COLORS.bg, padding: 20, paddingTop: 40 },
-  modalTitle: { fontSize: 22, fontWeight: 'bold', color: COLORS.gold, marginBottom: 12 },
-  empty: { color: COLORS.textMuted, textAlign: 'center', padding: 20 },
-  tradeRow: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingVertical: 10, borderTopWidth: 1, borderTopColor: COLORS.cardBorder,
-  },
-  tradeRowFirst: { borderTopWidth: 0 },
-  tradeSideBadge: { paddingHorizontal: 10, paddingVertical: 3, borderRadius: 6, marginRight: 10 },
-  tradeSideText: { fontSize: 10, fontWeight: 'bold' },
-  tradeSize: { color: COLORS.text, fontSize: 13, width: 90, fontVariant: ['tabular-nums'] },
-  tradePrice: { color: COLORS.textSecondary, fontSize: 12, flex: 1, fontVariant: ['tabular-nums'] },
-  aiBadge: { fontSize: 11, color: COLORS.purple, fontWeight: '700' },
-  aiDecisionRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingVertical: 12, borderTopWidth: 1, borderTopColor: COLORS.cardBorder,
-  },
-  aiDecisionLeft: { flex: 1 },
-  aiDecisionAction: { fontSize: 16, fontWeight: 'bold', marginBottom: 2 },
-  aiDecisionModel: { fontSize: 10, color: COLORS.textMuted },
-  aiDecisionRight: { alignItems: 'flex-end' },
-  aiDecisionRisk: { fontSize: 10, color: COLORS.textSecondary, marginTop: 4 },
-  settingsRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.cardBorder,
-  },
-  settingsLabel: { fontSize: 13, color: COLORS.textSecondary },
-  settingsValue: { fontSize: 13, color: COLORS.gold, fontWeight: '500', fontVariant: ['tabular-nums'], maxWidth: '55%', textAlign: 'right' },
-});

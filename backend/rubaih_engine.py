@@ -522,11 +522,16 @@ class FuturesCycleStrategist:
         self.margin_buffer = float(tcfg.get("margin_buffer", 0.85))
         self.taker_fee = float(CFG.get("exchange", {}).get("taker_fee", 0.00075))
         self.min_interval = float(tcfg.get("min_hedge_interval_sec", 45))
+        # Trailing lock: sell if unrealized PnL gives back N INR from peak
+        self.trail_giveback_inr = float(scfg.get("profit_trail_giveback_inr", 50))
+        self.trail_arm_inr = float(scfg.get("profit_trail_arm_inr", 80))
         self._last_signal = 0.0
         self._entry_ts = 0.0
+        self._peak_pnl_inr = 0.0
         self._prices: Dict[str, Deque[float]] = {}
         self._last_scan_log = 0.0
         self._last_entry_pair: Optional[str] = None
+        self._last_scan_msg: Optional[str] = None
 
     def _buf(self, pair: str) -> Deque[float]:
         if pair not in self._prices:
@@ -611,10 +616,11 @@ class FuturesCycleStrategist:
             top = ", ".join(
                 f"{p}:{m:.2%}~₹{mar:.0f}" for _s, m, p, _sp, _q, mar in sorted(ranked, reverse=True)[:5]
             ) or "none"
-            print(
+            self._last_scan_msg = (
                 f"[SCAN] candidates={len(pair_mids)} qualifying={len(ranked)} "
                 f"warm={warming} flat={skipped_move} unaffordable={skipped_size} top=[{top}]"
             )
+            print(self._last_scan_msg)
 
         if not ranked:
             return None
@@ -634,6 +640,7 @@ class FuturesCycleStrategist:
 
         self._last_signal = now
         self._entry_ts = now
+        self._peak_pnl_inr = 0.0
         self._last_entry_pair = pair
         return HedgeSignal(
             now, qty, 0.0, qty, "passive",
@@ -648,11 +655,13 @@ class FuturesCycleStrategist:
         position: Optional[Position],
         pair: str,
     ) -> Optional[HedgeSignal]:
-        """Manage open long: TP / SL / timeout."""
+        """Manage open long: trail giveback / TP / SL / timeout.
+
+        Exits are NOT blocked by min_interval — that only gates new entries.
+        (Blocking exits after entry caused winners to ride into liquidation.)
+        """
         now = time.time()
         if spot <= 0 or not position or position.size <= 0:
-            return None
-        if now - self._last_signal < self.min_interval:
             return None
 
         side = (position.side or "buy").lower()
@@ -662,31 +671,55 @@ class FuturesCycleStrategist:
             if self._entry_ts <= 0:
                 self._entry_ts = now
             pnl_pct = (spot - entry) / entry
+            pnl_usdt = (spot - entry) * size
+            pnl_inr = pnl_usdt * self.usdt_inr
+            self._peak_pnl_inr = max(self._peak_pnl_inr, pnl_inr)
             held = now - self._entry_ts
-            if pnl_pct >= self.take_profit_pct:
+            giveback = self._peak_pnl_inr - pnl_inr
+
+            # Trail lock: peaked in profit, then gave back ≥ ₹50 → sell now
+            if (
+                self._peak_pnl_inr >= self.trail_arm_inr
+                and giveback >= self.trail_giveback_inr
+            ):
                 self._last_signal = now
+                peak = self._peak_pnl_inr
+                self._peak_pnl_inr = 0.0
                 return HedgeSignal(
                     now, 0.0, size, -size, "immediate",
-                    f"EXIT_TP: {pair} +{pnl_pct:.2%} size={size}", False,
+                    f"EXIT_TRAIL: {pair} peak=₹{peak:.0f} now=₹{pnl_inr:.0f} "
+                    f"giveback=₹{giveback:.0f} size={size}",
+                    False,
+                    pair=pair,
+                )
+            if pnl_pct >= self.take_profit_pct:
+                self._last_signal = now
+                self._peak_pnl_inr = 0.0
+                return HedgeSignal(
+                    now, 0.0, size, -size, "immediate",
+                    f"EXIT_TP: {pair} +{pnl_pct:.2%} ~₹{pnl_inr:.0f} size={size}", False,
                     pair=pair,
                 )
             if pnl_pct <= -self.stop_loss_pct:
                 self._last_signal = now
+                self._peak_pnl_inr = 0.0
                 return HedgeSignal(
                     now, 0.0, size, -size, "immediate",
-                    f"EXIT_SL: {pair} {pnl_pct:.2%} size={size}", False,
+                    f"EXIT_SL: {pair} {pnl_pct:.2%} ~₹{pnl_inr:.0f} size={size}", False,
                     pair=pair,
                 )
             if held >= self.max_hold_sec:
                 self._last_signal = now
+                self._peak_pnl_inr = 0.0
                 return HedgeSignal(
                     now, 0.0, size, -size, "passive",
-                    f"EXIT_TIMEOUT: {pair} held={held:.0f}s size={size}", False,
+                    f"EXIT_TIMEOUT: {pair} held={held:.0f}s ~₹{pnl_inr:.0f} size={size}", False,
                     pair=pair,
                 )
             return None
         if side == "sell":
             self._last_signal = now
+            self._peak_pnl_inr = 0.0
             return HedgeSignal(
                 now, 0.0, -size, size, "immediate",
                 f"EXIT_FLATTEN_SHORT: {pair} size={size}", False,
@@ -706,6 +739,7 @@ class FuturesCycleStrategist:
         if position and position.size > 0:
             return self.evaluate_exit(spot, position, pair)
         self._entry_ts = 0.0
+        self._peak_pnl_inr = 0.0
         return self.pick_entry({pair: spot}, {pair: min_qty})
 
 
@@ -839,6 +873,25 @@ class DataStore:
         await self.rd.set("rubaih:engine_status", status)
         await self.rd.publish("rubaih:status", json.dumps({"status": status, "ts": time.time()}))
 
+    async def push_log(self, line: str):
+        """Append a live log line for the mobile Logs tab."""
+        payload = {"ts": time.time(), "line": line}
+        try:
+            await self.rd.lpush("rubaih:logs", json.dumps(payload))
+            await self.rd.ltrim("rubaih:logs", 0, 199)
+            await self.rd.publish("rubaih:log", json.dumps(payload))
+        except Exception:
+            pass
+
+    async def publish_scan(self, rows: List[Dict]):
+        """Publish scanner table (pair, mid, move%) for Coins tab."""
+        payload = {"ts": time.time(), "pairs": rows}
+        try:
+            await self.rd.set("rubaih:scan", json.dumps(payload))
+            await self.rd.publish("rubaih:scan", json.dumps(payload))
+        except Exception:
+            pass
+
     async def save_hedge(self, signal: HedgeSignal, price: float, size: Optional[float] = None):
         side = "buy" if signal.hedge_size > 0 else "sell"
         qty = abs(size if size is not None else signal.hedge_size)
@@ -900,6 +953,29 @@ class RubaihBot:
         self._pair_mids: Dict[str, float] = {}
         self._ws_pair = self._active_pair
 
+    async def _log(self, line: str):
+        print(line)
+        try:
+            await self.store.push_log(line)
+        except Exception:
+            pass
+
+    def _scan_rows(self) -> List[Dict]:
+        rows = []
+        for pair in self._scan_pairs:
+            mid = self._pair_mids.get(pair, 0.0)
+            move = self.cycle._move_pct(pair, mid) if mid > 0 else None
+            base = pair.replace("B-", "").replace("I-", "").split("_")[0]
+            rows.append({
+                "pair": pair,
+                "base": base,
+                "mid": mid,
+                "move_pct": None if move is None else round(move * 100, 3),
+                "active": pair == self._active_pair,
+            })
+        rows.sort(key=lambda r: (r["move_pct"] is None, -(r["move_pct"] or -999)))
+        return rows
+
     def _round_qty(self, size: float, product: CoinDCXProduct) -> float:
         step = product.quantity_increment or 0.001
         if step <= 0:
@@ -919,6 +995,8 @@ class RubaihBot:
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 5000)),
             "target_margin_inr": str(cfg.get("target_margin_inr", 2000)),
+            "profit_trail_giveback_inr": str((cfg.get("strategy") or {}).get("profit_trail_giveback_inr", 50)),
+            "profit_trail_arm_inr": str((cfg.get("strategy") or {}).get("profit_trail_arm_inr", 80)),
             "leverage": str(cfg.get("leverage", 10)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
@@ -1514,6 +1592,13 @@ class RubaihBot:
                     break
 
                 if self._mode == "futures_cycle":
+                    try:
+                        await self.store.publish_scan(self._scan_rows())
+                    except Exception:
+                        pass
+                    if self.cycle._last_scan_msg:
+                        await self._log(self.cycle._last_scan_msg)
+                        self.cycle._last_scan_msg = None
                     pos, pos_pair = self._find_open_position()
                     signal = None
                     if pos and pos_pair:
@@ -1523,6 +1608,7 @@ class RubaihBot:
                             signal = self.cycle.evaluate_exit(exit_spot, pos, pos_pair)
                     else:
                         self.cycle._entry_ts = 0.0
+                        self.cycle._peak_pnl_inr = 0.0
                         mids = {
                             p: self._pair_mids[p]
                             for p in self._scan_pairs
@@ -1540,17 +1626,17 @@ class RubaihBot:
                     if signal and signal.hedge_size != 0:
                         if signal.pair:
                             await self._set_active_pair(signal.pair)
-                        print(f"[CYCLE] {signal.reason}")
+                        await self._log(f"[CYCLE] {signal.reason}")
                         await self._execute_hedge(signal)
                         await self._publish_snapshot()
                 else:
                     signal = self.strategist.evaluate(greeks, spot if spot > 0 else next(iter(self._pair_mids.values()), 0.0))
                     if signal and signal.hedge_size != 0:
-                        print(f"[HEDGE] {signal.reason}")
+                        await self._log(f"[HEDGE] {signal.reason}")
                         await self._execute_hedge(signal)
                         await self._publish_snapshot()
             except Exception as e:
-                print(f"[LOOP] Error: {e}")
+                await self._log(f"[LOOP] Error: {e}")
             await asyncio.sleep(1)
 
     async def _execute_hedge(self, signal: HedgeSignal, force: bool = False):
@@ -1577,36 +1663,34 @@ class RubaihBot:
 
         async def _place(qty: float):
             if qty <= 0 or qty < perp_prod.min_quantity:
-                print(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
+                await self._log(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
                 return False
             live_ok = self._live and self.client and self.client._auth_ok
             if not live_ok:
                 if self._live and self.client and not self.client._auth_ok:
                     if not getattr(self, "_live_block_warned", False):
                         self._live_block_warned = True
-                        print(
+                        await self._log(
                             "[LIVE BLOCKED] CoinDCX auth failed — simulating fills until AUTH OK. "
                             "Set LIVE_TRADING=false or fix API keys."
                         )
-                    print(f"[SIM] Would {side.value} {qty} {perp_symbol} @ ~{spot} (auth blocked)")
+                    await self._log(f"[SIM] Would {side.value} {qty} {perp_symbol} @ ~{spot} (auth blocked)")
                 else:
-                    print(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
+                    await self._log(f"[DRY-RUN] Would {side.value} {qty} {perp_symbol} @ ~{spot}")
                 await self.store.save_hedge(signal, spot, size=qty)
                 self._apply_dry_fill(perp_symbol, side, qty, spot)
                 return True
 
             result = await self.client.place_order(perp_prod.pair, side, qty, "market", self._leverage)
-            print(f"[HEDGE] LIVE order: {result}")
-            # Treat explicit API errors as failed — do not record a phantom fill
+            await self._log(f"[HEDGE] LIVE order: {result}")
             if isinstance(result, dict) and (
                 result.get("status") == "error"
                 or result.get("code") in (400, 401, 403, 500, "400", "401", "403", "500")
                 or result.get("error")
             ):
-                print(f"[HEDGE] Order rejected — not updating position: {result}")
+                await self._log(f"[HEDGE] Order rejected — not updating position: {result}")
                 return False
             await self.store.save_hedge(signal, spot, size=qty)
-            # Always update local cycle position so dashboard/exits work immediately
             self._apply_dry_fill(perp_symbol, side, qty, spot)
             return True
 
@@ -1654,14 +1738,17 @@ class RubaihBot:
                 if remain <= 1e-12:
                     self._dry_pos = None
                     self.cycle._entry_ts = 0.0
+                    self.cycle._peak_pnl_inr = 0.0
                 else:
                     pos.size = remain
             else:
                 self._dry_pos = None
+                self.cycle._peak_pnl_inr = 0.0
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
         else:
             self.portfolio.update_positions([])
+            self.cycle._peak_pnl_inr = 0.0
 
     async def _emergency_unwind(self):
         print("[EMERGENCY] Flattening...")

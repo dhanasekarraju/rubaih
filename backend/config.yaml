@@ -60,6 +60,10 @@ trading:
     stop_loss_pct: 0.0035
     max_hold_sec: 1800
     allow_short: false
+    # Lock profit: after any peak unrealized PnL, sell if it gives back this much (INR)
+    profit_trail_giveback_inr: 50
+    # Start trailing only after peak unrealized PnL reaches this (INR)
+    profit_trail_arm_inr: 80
 
 risk:
   kill_switch_on_drawdown: true
