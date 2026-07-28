@@ -175,7 +175,7 @@ class CoinDCXClient:
             except Exception:
                 return {}
 
-    async def _signed_post(self, path: str, body: Optional[Dict] = None) -> dict:
+    async def _signed_post(self, path: str, body: Optional[Dict] = None):
         extra = {k: v for k, v in dict(body or {}).items() if k != "timestamp"}
         body = {"timestamp": self._timestamp(), **extra}
         headers, payload = self.auth.sign(body)
@@ -195,7 +195,7 @@ class CoinDCXClient:
                         f"[API ERROR] {path} Cloudflare 403/1010 x{self._auth_errors} — "
                         "VPS IP may be banned by CoinDCX/Cloudflare"
                     )
-                return data if isinstance(data, dict) else {}
+                return data
             if resp.status == 401:
                 self._auth_ok = False
                 self._auth_errors += 1
@@ -210,7 +210,8 @@ class CoinDCXClient:
             else:
                 self._auth_errors = 0
                 self._auth_ok = True
-            return data if isinstance(data, dict) else {}
+            # CoinDCX futures/positions returns a JSON array — do not coerce to {}
+            return data
 
     async def verify_credentials(self) -> bool:
         """
@@ -220,7 +221,7 @@ class CoinDCXClient:
         for mode in ("ms", "s"):
             self._ts_mode = mode
 
-            # 1) Futures positions — documented under Futures End Points
+            # 1) Futures positions — success is often an empty list [] when flat
             pos = await self._signed_post(
                 "/exchange/v1/derivatives/futures/positions",
                 {
@@ -231,22 +232,37 @@ class CoinDCXClient:
             )
             if isinstance(pos, list):
                 self._auth_ok = True
-                print(f"[AUTH] CoinDCX futures OK (timestamp={mode}, margin={self.margin})")
+                print(
+                    f"[AUTH] CoinDCX futures OK (timestamp={mode}, margin={self.margin}, "
+                    f"positions={len(pos)})"
+                )
                 return True
             if isinstance(pos, dict) and pos.get("status") != "error" and pos.get("code") not in (401, "401"):
-                # some wrappers return {data: [...]}
-                if "data" in pos or "result" in pos or pos:
+                if "data" in pos or "result" in pos:
                     self._auth_ok = True
                     print(f"[AUTH] CoinDCX futures OK (timestamp={mode}): keys={list(pos.keys())[:6]}")
                     return True
             print(f"[AUTH] futures/positions failed timestamp={mode}: {pos}")
 
-            # 2) Spot-style users/info (optional secondary check)
+            # 2) Spot-style users/info
             info = await self._signed_post("/exchange/v1/users/info", {})
             if isinstance(info, dict) and info.get("status") != "error" and info.get("code") not in (401, "401"):
                 if info.get("coindcx_id") or info.get("email") or info.get("id") or "first_name" in info:
                     self._auth_ok = True
                     print(f"[AUTH] CoinDCX users/info OK (timestamp={mode})")
+                    # Re-check futures now that auth is confirmed
+                    pos2 = await self._signed_post(
+                        "/exchange/v1/derivatives/futures/positions",
+                        {
+                            "page": "1",
+                            "size": "10",
+                            "margin_currency_short_name": [self.margin],
+                        },
+                    )
+                    if isinstance(pos2, list):
+                        print(f"[AUTH] futures/positions OK after users/info (n={len(pos2)})")
+                    else:
+                        print(f"[AUTH] WARN futures/positions still odd: {pos2}")
                     return True
             print(f"[AUTH] users/info failed timestamp={mode}: {info}")
 
