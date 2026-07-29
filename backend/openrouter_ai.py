@@ -27,6 +27,7 @@ NVIDIA_MODEL = (
     or "meta/llama-3.3-70b-instruct"
 )
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_TIMEOUT_SEC = float(os.getenv("NVIDIA_TIMEOUT_SEC", "60"))
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -88,6 +89,10 @@ class OpenRouterAI:
         self._backoff_until = 0.0
         self._dead_models: Dict[str, float] = {}
         self._nvidia_warned = False
+        if self.nvidia_key:
+            print(f"[AI] Provider order: NVIDIA/{NVIDIA_MODEL} → OpenRouter fallback")
+        elif self.openrouter_key:
+            print("[AI] NVIDIA key missing — OpenRouter only")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -151,7 +156,7 @@ What is your decision?"""
                 NVIDIA_URL,
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=NVIDIA_TIMEOUT_SEC),
             ) as resp:
                 text = await resp.text()
                 if resp.status == 200:
@@ -170,7 +175,8 @@ What is your decision?"""
                 print(f"[AI] NVIDIA error {resp.status}: {text[:160]}")
                 return None
         except Exception as e:
-            print(f"[AI] NVIDIA exception: {e}")
+            detail = str(e) or "(no message)"
+            print(f"[AI] NVIDIA {type(e).__name__}: {detail} — OpenRouter fallback")
             return None
 
     async def _call_openrouter(self, model: str, messages: List[Dict]) -> Optional[str]:
