@@ -990,18 +990,32 @@ class RiskManager:
         self.max_delta = cfg["max_delta"]
         self.max_vega = cfg["max_vega"]
         self.max_dd = cfg["max_drawdown_pct"]
+        self.capital_base = float(cfg.get("capital_inr", 1000) or 1000)
         self._hwm = 0.0
         self._kill = False
         self._order_ts: List[float] = []
 
-    def check(self, greeks: GreeksSnapshot, pnl: float) -> Optional[str]:
+    def check(
+        self,
+        greeks: GreeksSnapshot,
+        pnl: float,
+        capital_base: Optional[float] = None,
+    ) -> Optional[str]:
         if self._kill:
             return "KILL_SWITCH_ACTIVE"
         self._hwm = max(self._hwm, pnl)
         dd = self._hwm - pnl
-        if self._hwm > 0 and dd / max(self._hwm, 1) > self.max_dd:
+        # Drawdown is a fraction of account capital, not a fraction of a tiny
+        # unrealized-PnL high-water mark. The old denominator made a move from
+        # +₹1 to -₹8 look like an 900% drawdown and forced an emergency exit.
+        base = max(float(capital_base or self.capital_base or 0), 1.0)
+        dd_pct = dd / base
+        if dd_pct > self.max_dd:
             self._kill = True
-            return f"MAX_DRAWDOWN: {dd/self._hwm:.1%}"
+            return (
+                f"MAX_DRAWDOWN: ₹{dd:.0f}/{base:.0f}={dd_pct:.1%} "
+                f"(limit {self.max_dd:.1%})"
+            )
         if abs(greeks.delta) > self.max_delta:
             self._kill = True
             return f"MAX_DELTA: {greeks.delta:.4f}"
@@ -2288,8 +2302,15 @@ class RubaihBot:
                 if self._dry_pos:
                     session_pnl = self._dry_pos.unrealized_pnl
 
-                violation = self.risk.check(greeks, session_pnl)
+                capital_base = max(
+                    float(self.cycle.free_capital_inr or 0)
+                    + float(self._margin_locked or 0),
+                    float(self.cycle.capital_inr or 0),
+                    1.0,
+                )
+                violation = self.risk.check(greeks, session_pnl, capital_base)
                 if violation:
+                    await self._log(f"[RISK] VIOLATION: {violation}")
                     await self.store.save_risk_event("VIOLATION", violation)
                     await self.store.set_engine_status("halted")
                     await self._emergency_unwind()
