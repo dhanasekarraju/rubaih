@@ -599,13 +599,13 @@ class FuturesCycleStrategist:
         self.entry_move_pct = float(scfg.get("entry_move_pct", 0.001))
         # TP and SL are fixed coin-price movements; ROE is derived for display.
         self.take_profit_price_pct = float(
-            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.044))
         )
         self.take_profit_roe = self.take_profit_price_pct * float(
             tcfg.get("leverage", 10)
         )  # derived for display
         self.stop_loss_price_pct = float(
-            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.015))
         )
         self.stop_loss_roe = self.stop_loss_price_pct * float(
             tcfg.get("leverage", 10)
@@ -623,16 +623,10 @@ class FuturesCycleStrategist:
         self.usdt_inr = float(tcfg.get("usdt_inr", 87))
         self.taker_fee = float(CFG.get("exchange", {}).get("taker_fee", 0.00075))
         self.min_interval = float(tcfg.get("min_hedge_interval_sec", 45))
-        self.max_loss_frac = float(scfg.get("max_loss_frac", 0.10))
+        self.max_loss_frac = float(scfg.get("max_loss_frac", 0.20))
         self.trail_arm_r = float(scfg.get("trail_arm_r", 1.0))
         self.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.5))
         self.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.20))
-        self.profit_lock_arm_fee_multiple = float(
-            scfg.get("profit_lock_arm_fee_multiple", 1.5)
-        )
-        self.profit_lock_floor_fee_multiple = float(
-            scfg.get("profit_lock_floor_fee_multiple", 1.10)
-        )
         self._last_signal = 0.0
         self._entry_ts = 0.0
         self._peak_pnl_inr = 0.0
@@ -956,9 +950,7 @@ class FuturesCycleStrategist:
         max_loss = self._margin_used * self.max_loss_frac
         arm_inr = self._r_inr * self.trail_arm_r
         round_trip_fee = entry * size * self.usdt_inr * self.taker_fee * 2.0
-        profit_lock_arm = round_trip_fee * self.profit_lock_arm_fee_multiple
-        profit_lock_floor = round_trip_fee * self.profit_lock_floor_fee_multiple
-        profit_lock_armed = self._peak_pnl_inr >= profit_lock_arm
+        trail_armed = self._peak_pnl_inr >= arm_inr
         giveback_need = max(
             self._r_inr * self.trail_giveback_r,
             self._peak_pnl_inr * self.trail_giveback_of_peak if self._peak_pnl_inr > 0 else 0.0,
@@ -972,7 +964,7 @@ class FuturesCycleStrategist:
                 f"giveback=₹{giveback:.0f}/{giveback_need:.0f} "
                 f"TP={self._tp_price:.4f} SL={self._sl_price:.4f} "
                 f"maxloss=₹{max_loss:.0f} 1R=₹{self._r_inr:.0f} "
-                f"fees~₹{round_trip_fee:.0f} profit_lock={'ON' if profit_lock_armed else 'off'}"
+                f"fees~₹{round_trip_fee:.0f} trail={'ON' if trail_armed else 'off'}"
             )
 
         def _exit(reason: str) -> HedgeSignal:
@@ -994,17 +986,6 @@ class FuturesCycleStrategist:
             return _exit(
                 f"EXIT_TRAIL: {pair} peak=₹{self._peak_pnl_inr:.0f} now=₹{pnl:.0f} "
                 f"giveback=₹{giveback:.0f} need=₹{giveback_need:.0f}"
-            )
-        # Once gross profit clears estimated round-trip fees with a buffer, do
-        # not let it decay through break-even. Only exit while gross PnL still
-        # covers fees; if a fast tick already jumped negative, wait for SL.
-        if (
-            profit_lock_armed
-            and round_trip_fee <= pnl <= profit_lock_floor
-        ):
-            return _exit(
-                f"EXIT_PROFIT_LOCK: {pair} peak=₹{self._peak_pnl_inr:.0f} "
-                f"now=₹{pnl:.0f} fees~₹{round_trip_fee:.0f}"
             )
         pnl_pct = (spot - entry) / entry
         if pnl_pct >= self.take_profit_pct:
@@ -1386,14 +1367,14 @@ class RubaihBot:
             "margin_use_frac": str(cfg.get("margin_use_frac", 0.55)),
             "margin_use_max_frac": str(cfg.get("margin_use_max_frac", 0.60)),
             "take_profit_price_pct": str(
-                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.044))
             ),
             "stop_loss_price_pct": str(
-                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.015))
             ),
-            "take_profit_pct": str(scfg.get("take_profit_pct", 0.022)),
-            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.010)),
-            "max_loss_frac": str(scfg.get("max_loss_frac", 0.10)),
+            "take_profit_pct": str(scfg.get("take_profit_pct", 0.044)),
+            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.015)),
+            "max_loss_frac": str(scfg.get("max_loss_frac", 0.20)),
             "trail_arm_r": str(scfg.get("trail_arm_r", 1.0)),
             "trail_giveback_r": str(scfg.get("trail_giveback_r", 0.5)),
             "leverage": str(cfg.get("leverage", 10)),
@@ -1455,14 +1436,14 @@ class RubaihBot:
                 self.risk.max_delta = float(defaults["max_delta"])
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
         self.cycle.take_profit_price_pct = float(
-            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.044))
         )
         self.cycle.stop_loss_price_pct = float(
-            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.015))
         )
         self.cycle.take_profit_pct = self.cycle.take_profit_price_pct
         self.cycle.stop_loss_pct = self.cycle.stop_loss_price_pct
-        self.cycle.max_loss_frac = float(scfg.get("max_loss_frac", 0.10))
+        self.cycle.max_loss_frac = float(scfg.get("max_loss_frac", 0.20))
         self.cycle.trail_arm_r = float(scfg.get("trail_arm_r", 1.0))
         self.cycle.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.5))
         self.cycle.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.20))
