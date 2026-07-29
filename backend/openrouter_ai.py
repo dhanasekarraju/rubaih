@@ -1,8 +1,8 @@
 """
 ================================================================================
-RUBAIH AI — Gemini primary, OpenRouter fallback
+RUBAIH AI — NVIDIA NIM primary, OpenRouter fallback
 ================================================================================
-1) Google Gemini (GEMINI_API_KEY) — preferred
+1) NVIDIA NIM (NVIDIA_API_KEY) — preferred
 2) OpenRouter free models (OPENROUTER_API_KEY) — fallback
 Quant / futures_cycle engine keeps running if both fail.
 ================================================================================
@@ -21,16 +21,12 @@ load_dotenv()
 
 import aiohttp
 
-GEMINI_KEY = (
-    os.getenv("GEMINI_API_KEY", "").strip()
-    or os.getenv("GOOGLE_API_KEY", "").strip()
-    or os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+NVIDIA_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_MODEL = (
+    os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct").strip()
+    or "meta/llama-3.3-70b-instruct"
 )
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -54,7 +50,7 @@ class AIDecision:
 
 
 def ai_configured() -> bool:
-    return bool(GEMINI_KEY or OPENROUTER_KEY)
+    return bool(NVIDIA_KEY or OPENROUTER_KEY)
 
 
 def _extract_json(text: str) -> dict:
@@ -79,10 +75,10 @@ def _extract_json(text: str) -> dict:
 
 
 class OpenRouterAI:
-    """Gemini first, then OpenRouter. Same analyze_market() interface as before."""
+    """NVIDIA NIM first, then OpenRouter. Name retained for engine compatibility."""
 
     def __init__(self):
-        self.gemini_key = GEMINI_KEY
+        self.nvidia_key = NVIDIA_KEY
         self.openrouter_key = OPENROUTER_KEY
         self.session: Optional[aiohttp.ClientSession] = None
         self._call_history: List[Dict] = []
@@ -91,7 +87,7 @@ class OpenRouterAI:
         self._fail_streak = 0
         self._backoff_until = 0.0
         self._dead_models: Dict[str, float] = {}
-        self._gemini_warned = False
+        self._nvidia_warned = False
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -131,50 +127,50 @@ Rules:
 What is your decision?"""
         return system_prompt, user_prompt
 
-    async def _call_gemini(self, system_prompt: str, user_prompt: str) -> Optional[str]:
-        if not self.gemini_key:
+    async def _call_nvidia(self, messages: List[Dict]) -> Optional[str]:
+        if not self.nvidia_key:
             return None
-        dead_until = self._dead_models.get("gemini", 0)
+        dead_until = self._dead_models.get("nvidia", 0)
         if time.time() < dead_until:
             return None
 
         session = await self._get_session()
-        url = f"{GEMINI_URL}?key={self.gemini_key}"
+        headers = {
+            "Authorization": f"Bearer {self.nvidia_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 800,
-                "responseMimeType": "application/json",
-            },
+            "model": NVIDIA_MODEL,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 800,
+            "stream": False,
         }
         try:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            async with session.post(
+                NVIDIA_URL,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
                 text = await resp.text()
                 if resp.status == 200:
                     data = json.loads(text)
-                    parts = (
-                        data.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [])
-                    )
-                    out = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
-                    return out or None
+                    return data["choices"][0]["message"]["content"]
                 if resp.status == 429:
-                    self._dead_models["gemini"] = time.time() + 1800  # 30 min
-                    if not self._gemini_warned:
-                        self._gemini_warned = True
-                        print("[AI] Gemini rate limited — skip 30m, using OpenRouter")
+                    self._dead_models["nvidia"] = time.time() + 1800
+                    if not self._nvidia_warned:
+                        self._nvidia_warned = True
+                        print("[AI] NVIDIA rate limited — skip 30m, using OpenRouter")
                     return None
                 if resp.status in (400, 403, 404):
-                    self._dead_models["gemini"] = time.time() + 1800
-                    print(f"[AI] Gemini error {resp.status}: {text[:120]} — OpenRouter fallback")
+                    self._dead_models["nvidia"] = time.time() + 1800
+                    print(f"[AI] NVIDIA error {resp.status}: {text[:120]} — OpenRouter fallback")
                     return None
-                print(f"[AI] Gemini error {resp.status}: {text[:160]}")
+                print(f"[AI] NVIDIA error {resp.status}: {text[:160]}")
                 return None
         except Exception as e:
-            print(f"[AI] Gemini exception: {e}")
+            print(f"[AI] NVIDIA exception: {e}")
             return None
 
     async def _call_openrouter(self, model: str, messages: List[Dict]) -> Optional[str]:
@@ -261,19 +257,19 @@ What is your decision?"""
         self._last_call = now
 
         system_prompt, user_prompt = self._prompts(context)
-
-        # 1) Gemini primary
-        gemini_text = await self._call_gemini(system_prompt, user_prompt)
-        if gemini_text:
-            decision = self._parse_decision(gemini_text, f"gemini/{GEMINI_MODEL}")
-            if decision:
-                return decision
-
-        # 2) OpenRouter fallback
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+        # 1) NVIDIA NIM primary
+        nvidia_text = await self._call_nvidia(messages)
+        if nvidia_text:
+            decision = self._parse_decision(nvidia_text, f"nvidia/{NVIDIA_MODEL}")
+            if decision:
+                return decision
+
+        # 2) OpenRouter fallback
         for model in OPENROUTER_MODELS:
             content = await self._call_openrouter(model, messages)
             if content:
@@ -285,7 +281,7 @@ What is your decision?"""
         wait = min(1800, 120 * (2 ** min(self._fail_streak - 1, 4)))
         self._backoff_until = time.time() + wait
         if self._fail_streak <= 3 or self._fail_streak % 10 == 0:
-            print(f"[AI] Gemini+OpenRouter failed (x{self._fail_streak}). Quant continues. Retry in {wait:.0f}s")
+            print(f"[AI] NVIDIA+OpenRouter failed (x{self._fail_streak}). Quant continues. Retry in {wait:.0f}s")
         return None
 
     async def close(self):
