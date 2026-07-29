@@ -49,16 +49,22 @@ trading:
     entry_cooldown_sec: 75
     momentum_lookback: 24
     entry_move_pct: 0.001
-    # Locked at buy. RT taker fees ≈0.15% — TP must clear fees+slippage with room.
-    take_profit_pct: 0.012     # +1.2% (~2.4R) — net after fees ~1.0%
-    stop_loss_pct: 0.005       # −0.5% = 1R
+    # CoinDCX UI uses ROE% (≈ price% × leverage). We target ROE, then convert to price.
+    # Example @10x: TP ROE 12% → price +1.2% | SL ROE 5% → price −0.5%
+    # Example @5x (SOL): TP ROE 12% → price +2.4% | SL ROE 5% → price −1.0%
+    take_profit_roe: 0.12
+    stop_loss_roe: 0.05
+    # Legacy fallbacks if ROE keys missing
+    take_profit_pct: 0.012
+    stop_loss_pct: 0.005
+    # CoinDCX INR-M 422s on attached TP/SL — bot exits only
+    exchange_attach_tpsl: false
     max_hold_sec: 1200
     allow_short: false
-    # Risk vs THIS trade's margin (dynamic with capital)
-    max_loss_frac: 0.10          # cut if loss ≥ 10% of margin used
-    trail_arm_r: 1.0             # arm trail after +1R profit
-    trail_giveback_r: 0.5        # sell if give back 0.5R from peak (price or ₹)
-    trail_giveback_of_peak: 0.20 # or give back 20% of peak unrealized ₹
+    max_loss_frac: 0.10
+    trail_arm_r: 1.0
+    trail_giveback_r: 0.5
+    trail_giveback_of_peak: 0.20
 
 risk:
   kill_switch_on_drawdown: true

@@ -410,11 +410,11 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>How exits work</Text>
               <Text style={styles.help}>
-                {`TP +${fmtPricePct(settings?.take_profit_pct, 1.2)} and SL −${fmtPricePct(settings?.stop_loss_pct, 0.5)} are locked on the buy (price %, not margin %).`}
+                {`TP / SL match CoinDCX ROE (what you see as 10/20/30): target ROE +${Math.round((settings?.take_profit_roe ?? 0.12) * 100)}% / −${Math.round((settings?.stop_loss_roe ?? 0.05) * 100)}%.`}
                 {"\n"}
-                {`Also sent to CoinDCX as exchange take_profit / stop_loss on the entry order.`}
+                {`At 10x that is price +${(((settings?.take_profit_roe ?? 0.12) / 10) * 100).toFixed(2)}% / −${(((settings?.stop_loss_roe ?? 0.05) / 10) * 100).toFixed(2)}%. At 5x (SOL) price move is larger for the same ROE.`}
                 {"\n"}
-                {`Trail: after +1R profit, sell on ~0.5R giveback. Size uses ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free capital (that is NOT the TP).`}
+                {`Bot locks those prices at buy and sells (exchange TP/SL attach is off — was 422). Size ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free ≠ TP.`}
               </Text>
             </View>
           </>
@@ -498,8 +498,8 @@ export default function App() {
               <Text style={styles.cardTitle}>Bot (from server)</Text>
               <Row C={C} label="Free capital" value={`${settings?.free_capital_inr ?? settings?.capital_inr ?? '—'} INR`} />
               <Row C={C} label="Trade budget" value={`${settings?.trade_budget_inr ?? '—'} INR`} />
-              <Row C={C} label="Take profit" value={settings?.tp_display || `+${fmtPricePct(settings?.take_profit_pct, 1.2)}`} />
-              <Row C={C} label="Stop loss" value={settings?.sl_display || `−${fmtPricePct(settings?.stop_loss_pct, 0.5)}`} />
+              <Row C={C} label="Take profit" value={settings?.tp_display || `ROE +${Math.round((settings?.take_profit_roe ?? 0.12) * 100)}%`} />
+              <Row C={C} label="Stop loss" value={settings?.sl_display || `ROE −${Math.round((settings?.stop_loss_roe ?? 0.05) * 100)}%`} />
               <Row C={C} label="Size / free" value={`${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}%`} />
               <Row C={C} label="Leverage" value={`${settings?.leverage ?? '—'}x`} />
               <Row C={C} label="Active pair" value={settings?.active_pair || '—'} />
