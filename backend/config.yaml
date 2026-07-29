@@ -49,22 +49,27 @@ trading:
     entry_cooldown_sec: 75
     momentum_lookback: 24
     entry_move_pct: 0.001
-    # CoinDCX UI uses ROE% (≈ price% × leverage). We target ROE, then convert to price.
-    # Example @10x: TP ROE 12% → price +1.2% | SL ROE 5% → price −0.5%
-    # Example @5x (SOL): TP ROE 12% → price +2.4% | SL ROE 5% → price −1.0%
-    take_profit_roe: 0.12
-    stop_loss_roe: 0.05
-    # Legacy fallbacks if ROE keys missing
-    take_profit_pct: 0.012
-    stop_loss_pct: 0.005
+    # Fixed coin-price TP: +2.20% for every pair.
+    # CoinDCX ROE display is leverage-amplified: ≈+22% @10x, ≈+11% @5x.
+    take_profit_price_pct: 0.022
+    # Fixed price SL gives breathing room and keeps TP:SL ≈ 2.2:1.
+    # CoinDCX ROE display: ≈−10% @10x, ≈−5% @5x.
+    stop_loss_price_pct: 0.010
+    # Legacy fallbacks
+    take_profit_pct: 0.022
+    stop_loss_pct: 0.010
     # CoinDCX INR-M 422s on attached TP/SL — bot exits only
     exchange_attach_tpsl: false
-    max_hold_sec: 1200
+    # 0 disables time exits. Hold until TP, SL, max-loss, or profitable trail.
+    max_hold_sec: 0
     allow_short: false
     max_loss_frac: 0.10
     trail_arm_r: 1.0
     trail_giveback_r: 0.5
     trail_giveback_of_peak: 0.20
+    # Fee-aware profit protection: after peak clears fees by 1.5x, protect break-even.
+    profit_lock_arm_fee_multiple: 1.50
+    profit_lock_floor_fee_multiple: 1.10
 
 risk:
   kill_switch_on_drawdown: true

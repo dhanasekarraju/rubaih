@@ -308,11 +308,11 @@ export default function App() {
     return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
   const fmtNum = (n, d = 4) => (n == null ? '—' : Number(n).toFixed(d));
-  // Engine stores fractions (0.012 = 1.2%). If server ever sends 1.2 meaning percent, don't *100 again.
-  const fmtPricePct = (raw, fallbackPct = 1.2) => {
+  // Engine stores fractions (0.022 = 2.2%). Also tolerate a server sending 2.2.
+  const fmtPricePct = (raw, fallbackPct = 2.2) => {
     const n = Number(raw);
     if (!Number.isFinite(n) || n === 0) return `${Number(fallbackPct).toFixed(2)}%`;
-    const pct = n <= 1 ? n * 100 : n; // 0.012 → 1.2; 1.2 → 1.2
+    const pct = n <= 1 ? n * 100 : n; // 0.022 → 2.2; 2.2 → 2.2
     return `${pct.toFixed(2)}%`;
   };
 
@@ -410,9 +410,9 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>How exits work</Text>
               <Text style={styles.help}>
-                {`TP / SL match CoinDCX ROE (what you see as 10/20/30): target ROE +${Math.round((settings?.take_profit_roe ?? 0.12) * 100)}% / −${Math.round((settings?.stop_loss_roe ?? 0.05) * 100)}%.`}
+                {`TP is fixed at coin price +${fmtPricePct(settings?.take_profit_price_pct ?? settings?.take_profit_pct, 2.2)}. CoinDCX displays that as about +22% ROE @10x or +11% ROE @5x.`}
                 {"\n"}
-                {`At 10x that is price +${(((settings?.take_profit_roe ?? 0.12) / 10) * 100).toFixed(2)}% / −${(((settings?.stop_loss_roe ?? 0.05) / 10) * 100).toFixed(2)}%. At 5x (SOL) price move is larger for the same ROE.`}
+                {`SL is fixed at coin price −${fmtPricePct(settings?.stop_loss_price_pct ?? settings?.stop_loss_pct, 1.0)}, giving TP:SL ≈ 2.2:1.`}
                 {"\n"}
                 {`Bot locks those prices at buy and sells (exchange TP/SL attach is off — was 422). Size ${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}% of free ≠ TP.`}
               </Text>
@@ -498,8 +498,8 @@ export default function App() {
               <Text style={styles.cardTitle}>Bot (from server)</Text>
               <Row C={C} label="Free capital" value={`${settings?.free_capital_inr ?? settings?.capital_inr ?? '—'} INR`} />
               <Row C={C} label="Trade budget" value={`${settings?.trade_budget_inr ?? '—'} INR`} />
-              <Row C={C} label="Take profit" value={settings?.tp_display || `ROE +${Math.round((settings?.take_profit_roe ?? 0.12) * 100)}%`} />
-              <Row C={C} label="Stop loss" value={settings?.sl_display || `ROE −${Math.round((settings?.stop_loss_roe ?? 0.05) * 100)}%`} />
+              <Row C={C} label="Take profit" value={settings?.tp_display || `Price +${fmtPricePct(settings?.take_profit_price_pct ?? settings?.take_profit_pct, 2.2)}`} />
+              <Row C={C} label="Stop loss" value={settings?.sl_display || `Price −${fmtPricePct(settings?.stop_loss_price_pct ?? settings?.stop_loss_pct, 1.0)}`} />
               <Row C={C} label="Size / free" value={`${Math.round((settings?.margin_use_frac ?? 0.55) * 100)}–${Math.round((settings?.margin_use_max_frac ?? 0.60) * 100)}%`} />
               <Row C={C} label="Leverage" value={`${settings?.leverage ?? '—'}x`} />
               <Row C={C} label="Active pair" value={settings?.active_pair || '—'} />

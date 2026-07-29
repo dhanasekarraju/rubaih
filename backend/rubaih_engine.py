@@ -597,12 +597,23 @@ class FuturesCycleStrategist:
         self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 75))
         self.lookback = int(scfg.get("momentum_lookback", 24))
         self.entry_move_pct = float(scfg.get("entry_move_pct", 0.001))
-        # ROE targets (what CoinDCX UI shows). Price% = ROE / leverage at arm time.
-        self.take_profit_roe = float(scfg.get("take_profit_roe", 0.12))
-        self.stop_loss_roe = float(scfg.get("stop_loss_roe", 0.05))
-        self.take_profit_pct = float(scfg.get("take_profit_pct", 0.012))  # fallback / last armed
-        self.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.005))
-        self.max_hold_sec = float(scfg.get("max_hold_sec", 1200))
+        # TP and SL are fixed coin-price movements; ROE is derived for display.
+        self.take_profit_price_pct = float(
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+        )
+        self.take_profit_roe = self.take_profit_price_pct * float(
+            tcfg.get("leverage", 10)
+        )  # derived for display
+        self.stop_loss_price_pct = float(
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+        )
+        self.stop_loss_roe = self.stop_loss_price_pct * float(
+            tcfg.get("leverage", 10)
+        )
+        self.take_profit_pct = self.take_profit_price_pct
+        self.stop_loss_pct = self.stop_loss_price_pct
+        # 0 = no time-based exit; TP/SL/trail/max-loss remain authoritative.
+        self.max_hold_sec = float(scfg.get("max_hold_sec", 0))
         self.allow_short = bool(scfg.get("allow_short", False))
         self.capital_inr = float(tcfg.get("capital_inr", 5000))  # fallback
         self.free_capital_inr = self.capital_inr  # refreshed from exchange
@@ -616,6 +627,12 @@ class FuturesCycleStrategist:
         self.trail_arm_r = float(scfg.get("trail_arm_r", 1.0))
         self.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.5))
         self.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.20))
+        self.profit_lock_arm_fee_multiple = float(
+            scfg.get("profit_lock_arm_fee_multiple", 1.5)
+        )
+        self.profit_lock_floor_fee_multiple = float(
+            scfg.get("profit_lock_floor_fee_multiple", 1.10)
+        )
         self._last_signal = 0.0
         self._entry_ts = 0.0
         self._peak_pnl_inr = 0.0
@@ -742,9 +759,11 @@ class FuturesCycleStrategist:
         lev = float(leverage if leverage is not None else self.leverage)
         lev = max(lev, 1.0)
         self._trade_leverage = lev
-        # Convert ROE targets → price % for this trade's leverage
-        self.take_profit_pct = self.price_pct_from_roe(self.take_profit_roe, lev)
-        self.stop_loss_pct = self.price_pct_from_roe(self.stop_loss_roe, lev)
+        # Fixed price TP/SL across pairs; displayed ROE varies by leverage.
+        self.take_profit_pct = self.take_profit_price_pct
+        self.take_profit_roe = self.take_profit_pct * lev
+        self.stop_loss_pct = self.stop_loss_price_pct
+        self.stop_loss_roe = self.stop_loss_pct * lev
         self._plan_pair = pair
         self._plan_size = size
         self._entry_price = entry
@@ -761,8 +780,8 @@ class FuturesCycleStrategist:
         print(
             f"[PLAN] {pair} entry={entry:.4f} size={size} margin~₹{self._margin_used:.0f} "
             f"({100 * self._margin_used / free:.0f}% of free ₹{free:.0f}) @{lev:.0f}x | "
-            f"TP ROE=+{self.take_profit_roe:.0%} (price +{self.take_profit_pct:.2%}) → {self._tp_price:.4f} | "
-            f"SL ROE=-{self.stop_loss_roe:.0%} (price -{self.stop_loss_pct:.2%}) → {self._sl_price:.4f} | "
+            f"TP price=+{self.take_profit_pct:.2%} (ROE≈+{self.take_profit_roe:.0%}) → {self._tp_price:.4f} | "
+            f"SL price=-{self.stop_loss_pct:.2%} (ROE≈-{self.stop_loss_roe:.0%}) → {self._sl_price:.4f} | "
             f"1R=₹{self._r_inr:.0f} trail={self.trail_arm_r}R→{self.trail_giveback_r}R "
             f"max_loss={self.max_loss_frac:.0%} margin"
         )
@@ -871,7 +890,7 @@ class FuturesCycleStrategist:
         _score, move, pair, spot, qty, margin_inr, lev = ranked[0]
         notional_inr = qty * spot * self.usdt_inr
         fee_inr = notional_inr * self.taker_fee * 2
-        tp_pct = self.price_pct_from_roe(self.take_profit_roe, lev)
+        tp_pct = self.take_profit_price_pct
         tp_inr = notional_inr * tp_pct
         if tp_inr < fee_inr * 1.15:
             # Try next affordable candidate instead of burning the whole scan
@@ -879,7 +898,7 @@ class FuturesCycleStrategist:
                 _s, move, pair, spot, qty, margin_inr, lev = cand
                 notional_inr = qty * spot * self.usdt_inr
                 fee_inr = notional_inr * self.taker_fee * 2
-                tp_pct = self.price_pct_from_roe(self.take_profit_roe, lev)
+                tp_pct = self.take_profit_price_pct
                 tp_inr = notional_inr * tp_pct
                 if tp_inr >= fee_inr * 1.15:
                     break
@@ -891,7 +910,8 @@ class FuturesCycleStrategist:
             now, qty, 0.0, qty, "passive",
             f"ENTRY_LONG: {pair} move={move:.2%} size={qty:.6f} "
             f"margin~₹{margin_inr:.0f}/{free:.0f} free @{int(lev)}x "
-            f"TP_ROE=+{self.take_profit_roe:.0%} SL_ROE=-{self.stop_loss_roe:.0%}",
+            f"TP_PRICE=+{self.take_profit_price_pct:.2%} "
+            f"(ROE≈+{self.take_profit_price_pct * lev:.0%}) SL_ROE=-{self.stop_loss_roe:.0%}",
             False, pair=pair,
         )
 
@@ -932,10 +952,13 @@ class FuturesCycleStrategist:
         self._peak_price = max(self._peak_price, spot)
         giveback = self._peak_pnl_inr - pnl
         price_drop = self._peak_price - spot
-        held = now - self._entry_ts
 
         max_loss = self._margin_used * self.max_loss_frac
         arm_inr = self._r_inr * self.trail_arm_r
+        round_trip_fee = entry * size * self.usdt_inr * self.taker_fee * 2.0
+        profit_lock_arm = round_trip_fee * self.profit_lock_arm_fee_multiple
+        profit_lock_floor = round_trip_fee * self.profit_lock_floor_fee_multiple
+        profit_lock_armed = self._peak_pnl_inr >= profit_lock_arm
         giveback_need = max(
             self._r_inr * self.trail_giveback_r,
             self._peak_pnl_inr * self.trail_giveback_of_peak if self._peak_pnl_inr > 0 else 0.0,
@@ -948,7 +971,8 @@ class FuturesCycleStrategist:
                 f"[HOLD] {pair} spot={spot:.4f} pnl=₹{pnl:.0f} peak=₹{self._peak_pnl_inr:.0f} "
                 f"giveback=₹{giveback:.0f}/{giveback_need:.0f} "
                 f"TP={self._tp_price:.4f} SL={self._sl_price:.4f} "
-                f"maxloss=₹{max_loss:.0f} 1R=₹{self._r_inr:.0f}"
+                f"maxloss=₹{max_loss:.0f} 1R=₹{self._r_inr:.0f} "
+                f"fees~₹{round_trip_fee:.0f} profit_lock={'ON' if profit_lock_armed else 'off'}"
             )
 
         def _exit(reason: str) -> HedgeSignal:
@@ -962,18 +986,31 @@ class FuturesCycleStrategist:
             return _exit(f"EXIT_SL: {pair} spot<={self._sl_price:.4f} pnl=₹{pnl:.0f}")
         if pnl <= -abs(max_loss):
             return _exit(f"EXIT_MAXLOSS: {pair} pnl=₹{pnl:.0f} limit=-₹{max_loss:.0f}")
-        if self._peak_pnl_inr >= arm_inr and (giveback >= giveback_need or price_drop >= price_giveback_need):
+        if (
+            self._peak_pnl_inr >= arm_inr
+            and pnl >= round_trip_fee
+            and (giveback >= giveback_need or price_drop >= price_giveback_need)
+        ):
             return _exit(
                 f"EXIT_TRAIL: {pair} peak=₹{self._peak_pnl_inr:.0f} now=₹{pnl:.0f} "
                 f"giveback=₹{giveback:.0f} need=₹{giveback_need:.0f}"
+            )
+        # Once gross profit clears estimated round-trip fees with a buffer, do
+        # not let it decay through break-even. Only exit while gross PnL still
+        # covers fees; if a fast tick already jumped negative, wait for SL.
+        if (
+            profit_lock_armed
+            and round_trip_fee <= pnl <= profit_lock_floor
+        ):
+            return _exit(
+                f"EXIT_PROFIT_LOCK: {pair} peak=₹{self._peak_pnl_inr:.0f} "
+                f"now=₹{pnl:.0f} fees~₹{round_trip_fee:.0f}"
             )
         pnl_pct = (spot - entry) / entry
         if pnl_pct >= self.take_profit_pct:
             return _exit(f"EXIT_TP_PCT: {pair} +{pnl_pct:.2%} pnl=₹{pnl:.0f}")
         if pnl_pct <= -self.stop_loss_pct:
             return _exit(f"EXIT_SL_PCT: {pair} {pnl_pct:.2%} pnl=₹{pnl:.0f}")
-        if held >= self.max_hold_sec:
-            return _exit(f"EXIT_TIMEOUT: {pair} held={held:.0f}s pnl=₹{pnl:.0f}")
         return None
 
     def evaluate(self, spot: float, position: Optional[Position], min_qty: float, pair: Optional[str] = None) -> Optional[HedgeSignal]:
@@ -1348,10 +1385,14 @@ class RubaihBot:
             "capital_inr": str(cfg.get("capital_inr", 5000)),
             "margin_use_frac": str(cfg.get("margin_use_frac", 0.55)),
             "margin_use_max_frac": str(cfg.get("margin_use_max_frac", 0.60)),
-            "take_profit_roe": str(scfg.get("take_profit_roe", 0.12)),
-            "stop_loss_roe": str(scfg.get("stop_loss_roe", 0.05)),
-            "take_profit_pct": str(scfg.get("take_profit_pct", 0.012)),
-            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.005)),
+            "take_profit_price_pct": str(
+                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+            ),
+            "stop_loss_price_pct": str(
+                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+            ),
+            "take_profit_pct": str(scfg.get("take_profit_pct", 0.022)),
+            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.010)),
             "max_loss_frac": str(scfg.get("max_loss_frac", 0.10)),
             "trail_arm_r": str(scfg.get("trail_arm_r", 1.0)),
             "trail_giveback_r": str(scfg.get("trail_giveback_r", 0.5)),
@@ -1366,7 +1407,8 @@ class RubaihBot:
         }
         force_keys = (
             "mode", "capital_inr", "margin_use_frac", "margin_use_max_frac", "leverage",
-            "take_profit_roe", "stop_loss_roe", "take_profit_pct", "stop_loss_pct",
+            "take_profit_price_pct", "stop_loss_price_pct",
+            "take_profit_pct", "stop_loss_pct",
             "perp_symbol", "margin_currency", "live_trading", "max_delta",
         )
         existing = await self.store.rd.hgetall("rubaih:settings")
@@ -1395,10 +1437,14 @@ class RubaihBot:
                 self.cycle.margin_use_frac = float(defaults["margin_use_frac"])
             elif k == "margin_use_max_frac":
                 self.cycle.margin_use_max_frac = float(defaults["margin_use_max_frac"])
-            elif k == "take_profit_roe":
-                self.cycle.take_profit_roe = float(defaults["take_profit_roe"])
-            elif k == "stop_loss_roe":
-                self.cycle.stop_loss_roe = float(defaults["stop_loss_roe"])
+            elif k == "take_profit_price_pct":
+                self.cycle.take_profit_price_pct = float(
+                    defaults["take_profit_price_pct"]
+                )
+            elif k == "stop_loss_price_pct":
+                self.cycle.stop_loss_price_pct = float(
+                    defaults["stop_loss_price_pct"]
+                )
             elif k == "take_profit_pct":
                 self.cycle.take_profit_pct = float(defaults["take_profit_pct"])
             elif k == "stop_loss_pct":
@@ -1408,28 +1454,36 @@ class RubaihBot:
             elif k == "max_delta":
                 self.risk.max_delta = float(defaults["max_delta"])
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
-        self.cycle.take_profit_roe = float(scfg.get("take_profit_roe", 0.12))
-        self.cycle.stop_loss_roe = float(scfg.get("stop_loss_roe", 0.05))
-        self.cycle.take_profit_pct = float(scfg.get("take_profit_pct", 0.012))
-        self.cycle.stop_loss_pct = float(scfg.get("stop_loss_pct", 0.005))
+        self.cycle.take_profit_price_pct = float(
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+        )
+        self.cycle.stop_loss_price_pct = float(
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.010))
+        )
+        self.cycle.take_profit_pct = self.cycle.take_profit_price_pct
+        self.cycle.stop_loss_pct = self.cycle.stop_loss_price_pct
         self.cycle.max_loss_frac = float(scfg.get("max_loss_frac", 0.10))
         self.cycle.trail_arm_r = float(scfg.get("trail_arm_r", 1.0))
         self.cycle.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.5))
         self.cycle.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.20))
         # App shows CoinDCX-style ROE (what you see as 10/20/30 on exchange)
         lev = max(1, int(self._leverage or 10))
-        tp_px = self.cycle.price_pct_from_roe(self.cycle.take_profit_roe, lev)
-        sl_px = self.cycle.price_pct_from_roe(self.cycle.stop_loss_roe, lev)
+        tp_px = self.cycle.take_profit_price_pct
+        tp_roe = tp_px * lev
+        sl_px = self.cycle.stop_loss_price_pct
+        sl_roe = sl_px * lev
         try:
             await self.store.rd.hset(
                 "rubaih:settings",
                 mapping={
-                    "take_profit_roe": str(self.cycle.take_profit_roe),
-                    "stop_loss_roe": str(self.cycle.stop_loss_roe),
+                    "take_profit_price_pct": str(tp_px),
+                    "take_profit_roe": str(tp_roe),
+                    "stop_loss_price_pct": str(sl_px),
+                    "stop_loss_roe": str(sl_roe),
                     "take_profit_pct": str(tp_px),
                     "stop_loss_pct": str(sl_px),
-                    "tp_display": f"ROE +{self.cycle.take_profit_roe*100:.0f}% (price +{tp_px*100:.2f}% @{lev}x)",
-                    "sl_display": f"ROE −{self.cycle.stop_loss_roe*100:.0f}% (price −{sl_px*100:.2f}% @{lev}x)",
+                    "tp_display": f"Price +{tp_px*100:.2f}% (ROE≈+{tp_roe*100:.0f}% @{lev}x)",
+                    "sl_display": f"Price −{sl_px*100:.2f}% (ROE≈−{sl_roe*100:.0f}% @{lev}x)",
                 },
             )
         except Exception:
@@ -1437,8 +1491,8 @@ class RubaihBot:
         print(
             f"[SETTINGS] Forced from config: mode={self._mode} capital≈₹{self.cycle.capital_inr} "
             f"use={self.cycle.margin_use_frac:.0%}–{self.cycle.margin_use_max_frac:.0%} of free "
-            f"TP_ROE=+{self.cycle.take_profit_roe:.0%} SL_ROE=-{self.cycle.stop_loss_roe:.0%} "
-            f"(@{lev}x → price +{tp_px:.2%}/-{sl_px:.2%}) "
+            f"TP_PRICE=+{tp_px:.2%} (ROE≈+{tp_roe:.0%} @{lev}x) "
+            f"SL_PRICE=-{sl_px:.2%} (ROE≈-{sl_roe:.0%} @{lev}x) "
             f"trail={self.cycle.trail_arm_r}R→{self.cycle.trail_giveback_r}R "
             f"max_loss={self.cycle.max_loss_frac:.0%} margin lev={self._leverage}x"
         )
@@ -1472,10 +1526,19 @@ class RubaihBot:
             self.cycle.margin_use_frac = float(data["margin_use_frac"])
         if "margin_use_max_frac" in data:
             self.cycle.margin_use_max_frac = float(data["margin_use_max_frac"])
-        if "take_profit_pct" in data:
-            self.cycle.take_profit_pct = float(data["take_profit_pct"])
-        if "stop_loss_pct" in data:
-            self.cycle.stop_loss_pct = float(data["stop_loss_pct"])
+        if "take_profit_price_pct" in data:
+            self.cycle.take_profit_price_pct = float(data["take_profit_price_pct"])
+            self.cycle.take_profit_pct = self.cycle.take_profit_price_pct
+        elif "take_profit_pct" in data:
+            # Backward-compatible API key; it means coin price movement.
+            self.cycle.take_profit_price_pct = float(data["take_profit_pct"])
+            self.cycle.take_profit_pct = self.cycle.take_profit_price_pct
+        if "stop_loss_price_pct" in data:
+            self.cycle.stop_loss_price_pct = float(data["stop_loss_price_pct"])
+            self.cycle.stop_loss_pct = self.cycle.stop_loss_price_pct
+        elif "stop_loss_pct" in data:
+            self.cycle.stop_loss_price_pct = float(data["stop_loss_pct"])
+            self.cycle.stop_loss_pct = self.cycle.stop_loss_price_pct
         if "max_loss_frac" in data:
             self.cycle.max_loss_frac = float(data["max_loss_frac"])
         if "trail_arm_r" in data:
