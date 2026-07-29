@@ -23,8 +23,8 @@ import aiohttp
 
 NVIDIA_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 NVIDIA_MODEL = (
-    os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct").strip()
-    or "meta/llama-3.3-70b-instruct"
+    os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-nano-30b-a3b").strip()
+    or "nvidia/nemotron-3-nano-30b-a3b"
 )
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_TIMEOUT_SEC = float(os.getenv("NVIDIA_TIMEOUT_SEC", "60"))
