@@ -49,25 +49,24 @@ trading:
     entry_cooldown_sec: 75
     momentum_lookback: 24
     entry_move_pct: 0.001
-    # Fixed coin-price TP: +4.40% for every pair.
-    # CoinDCX ROE display is leverage-amplified: ≈+44% @10x, ≈+22% @5x.
-    take_profit_price_pct: 0.044
-    # Fixed price SL: −1.50%; TP:SL ≈ 2.9:1 (breathing room without over-tight stops).
-    # CoinDCX ROE display: ≈−15% @10x, ≈−7.5% @5x.
-    stop_loss_price_pct: 0.015
+    # Faster exits for majors: TP +2.20% (ROE≈+22% @10x / +11% @5x).
+    take_profit_price_pct: 0.022
+    # SL −1.10% → TP:SL = 2:1 (ROE≈−11% @10x / −5.5% @5x).
+    stop_loss_price_pct: 0.011
     # Legacy fallbacks
-    take_profit_pct: 0.044
-    stop_loss_pct: 0.015
+    take_profit_pct: 0.022
+    stop_loss_pct: 0.011
     # CoinDCX INR-M 422s on attached TP/SL — bot exits only
     exchange_attach_tpsl: false
     # 0 disables time exits. Hold until TP, SL, max-loss, or profitable trail.
     max_hold_sec: 0
     allow_short: false
-    # Above −1.5% @10x (~15% ROE) so SL hits first; safety net only.
-    max_loss_frac: 0.20
-    trail_arm_r: 1.0
-    trail_giveback_r: 0.5
-    trail_giveback_of_peak: 0.20
+    # Above −1.1% @10x (~11% ROE) so soft SL hits first.
+    max_loss_frac: 0.12
+    # Arm trail after 0.5R (fee-safe) so winners can lock earlier than full TP.
+    trail_arm_r: 0.5
+    trail_giveback_r: 0.4
+    trail_giveback_of_peak: 0.25
 risk:
   kill_switch_on_drawdown: true
   kill_switch_on_delta_limit: true
