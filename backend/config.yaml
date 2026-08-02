@@ -30,8 +30,9 @@ trading:
     - B-BTC_USDT
     - B-ETH_USDT
     - B-SOL_USDT
+    - B-BNB_USDT
   scan_fill_extras: false
-  scan_max_pairs: 3
+  scan_max_pairs: 4
   scan_interval_sec: 5
 
   delta_threshold: 0.0005

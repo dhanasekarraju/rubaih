@@ -1981,6 +1981,7 @@ class RubaihBot:
         self.pricing.update_surface("BTC", 0.55, -0.15, 0.08)
         self.pricing.update_surface("ETH", 0.60, -0.18, 0.10)
         self.pricing.update_surface("SOL", 0.70, -0.12, 0.10)
+        self.pricing.update_surface("BNB", 0.65, -0.12, 0.10)
         print(f"[RUBAIH] Loaded {len(self.products)} CoinDCX instruments")
         print(f"[RUBAIH] Scan pairs ({len(self._scan_pairs)}): {', '.join(self._scan_pairs[:8])}{'…' if len(self._scan_pairs) > 8 else ''}")
         print(f"[RUBAIH] Mode: {self._mode} | scan={'ON' if self._scan_enabled else 'OFF'}")

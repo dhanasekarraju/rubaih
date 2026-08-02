@@ -356,7 +356,7 @@ async def get_settings():
             "perp_symbol": "B-BTC_USDT",
             "active_pair": "B-BTC_USDT",
             "scan_enabled": "true",
-            "scan_pairs": "B-BTC_USDT,B-ETH_USDT,B-SOL_USDT",
+            "scan_pairs": "B-BTC_USDT,B-ETH_USDT,B-SOL_USDT,B-BNB_USDT",
         }
     # Keep non-float metadata as strings in response
     string_keys = {
