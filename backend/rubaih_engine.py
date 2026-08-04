@@ -587,45 +587,45 @@ class FuturesCycleStrategist:
     """
     Momentum scanner + capital-fraction sizing + R-multiple exits.
 
-    Size = 50–60% of *live free* futures margin (not fixed ₹).
+    Size = 25–30% of *live free* futures margin (not fixed ₹).
     At buy: lock TP/SL prices. Trail in R (1R = stop distance).
     """
 
     def __init__(self):
         tcfg = CFG["trading"]
         scfg = tcfg.get("strategy") or {}
-        self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 75))
+        self.entry_cooldown = float(scfg.get("entry_cooldown_sec", 150))
         self.lookback = int(scfg.get("momentum_lookback", 24))
-        self.entry_move_pct = float(scfg.get("entry_move_pct", 0.001))
+        self.entry_move_pct = float(scfg.get("entry_move_pct", 0.0025))
         # TP and SL are fixed coin-price movements; ROE is derived for display.
         self.take_profit_price_pct = float(
-            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.014))
         )
         self.take_profit_roe = self.take_profit_price_pct * float(
             tcfg.get("leverage", 10)
         )  # derived for display
         self.stop_loss_price_pct = float(
-            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.011))
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.007))
         )
         self.stop_loss_roe = self.stop_loss_price_pct * float(
             tcfg.get("leverage", 10)
         )
         self.take_profit_pct = self.take_profit_price_pct
         self.stop_loss_pct = self.stop_loss_price_pct
-        # 0 = no time-based exit; TP/SL/trail/max-loss remain authoritative.
-        self.max_hold_sec = float(scfg.get("max_hold_sec", 0))
+        # 0 = no time-based exit; otherwise flatten after max hold.
+        self.max_hold_sec = float(scfg.get("max_hold_sec", 14400))
         self.allow_short = bool(scfg.get("allow_short", False))
         self.capital_inr = float(tcfg.get("capital_inr", 5000))  # fallback
         self.free_capital_inr = self.capital_inr  # refreshed from exchange
-        self.margin_use_frac = float(tcfg.get("margin_use_frac", 0.55))
-        self.margin_use_max_frac = float(tcfg.get("margin_use_max_frac", 0.60))
+        self.margin_use_frac = float(tcfg.get("margin_use_frac", 0.25))
+        self.margin_use_max_frac = float(tcfg.get("margin_use_max_frac", 0.30))
         self.leverage = int(tcfg.get("leverage", 10))
         self.usdt_inr = float(tcfg.get("usdt_inr", 87))
         self.taker_fee = float(CFG.get("exchange", {}).get("taker_fee", 0.00075))
         self.min_interval = float(tcfg.get("min_hedge_interval_sec", 45))
-        self.max_loss_frac = float(scfg.get("max_loss_frac", 0.12))
-        self.trail_arm_r = float(scfg.get("trail_arm_r", 0.5))
-        self.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.4))
+        self.max_loss_frac = float(scfg.get("max_loss_frac", 0.08))
+        self.trail_arm_r = float(scfg.get("trail_arm_r", 0.35))
+        self.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.30))
         self.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.25))
         self._last_signal = 0.0
         self._entry_ts = 0.0
@@ -674,7 +674,7 @@ class FuturesCycleStrategist:
         leverage: Optional[float] = None,
         step: Optional[float] = None,
     ) -> float:
-        """Size off free capital. Prefer 50–60%; allow min-lot using up to 100% free."""
+        """Size off free capital within margin_use_max_frac. Never all-in for min lot."""
         if spot <= 0 or self.usdt_inr <= 0:
             return 0.0
         lev = float(leverage if leverage is not None else self.leverage)
@@ -683,25 +683,28 @@ class FuturesCycleStrategist:
         free = max(self.free_capital_inr, self.capital_inr, 0.0)
         if free <= 0:
             return 0.0
+        max_margin = min(free, free * self.margin_use_max_frac)
         budget = self.trade_margin_budget()
         qty = (budget * lev) / (spot * self.usdt_inr) if budget > 0 else 0.0
         min_q = max(float(min_qty or 0.0), 0.0)
         min_margin = (min_q * spot * self.usdt_inr) / lev if min_q > 0 else 0.0
 
-        # Below exchange min lot: still buy if the whole free balance can cover it
+        def _can_take_min() -> bool:
+            # Min lot allowed only if it fits inside the hard margin cap (not 100% free).
+            return min_q > 0 and min_margin <= max_margin * 1.001
+
+        # Below exchange min lot: take min only if within max_frac×free
         if min_q > 0 and qty + 1e-12 < min_q:
-            if min_margin <= free * 1.001:
+            if _can_take_min():
                 qty = min_q
             else:
                 return 0.0
         else:
-            # Cap preferred size at max frac; never exceed free
-            max_margin = min(free, free * self.margin_use_max_frac)
             margin = (qty * spot * self.usdt_inr) / lev
             if margin > max_margin * 1.01:
                 qty = (max_margin * lev) / (spot * self.usdt_inr)
             if min_q > 0 and qty + 1e-12 < min_q:
-                if min_margin <= free * 1.001:
+                if _can_take_min():
                     qty = min_q
                 else:
                     return 0.0
@@ -713,8 +716,7 @@ class FuturesCycleStrategist:
             decimals = max(0, min(8, int(round(-math.log10(st))) if st < 1 else 0))
             floored = round(floored, decimals)
             if floored + 1e-12 < min_q:
-                # bump to exact min if still affordable
-                if min_margin <= free * 1.001:
+                if _can_take_min():
                     qty = min_q
                 else:
                     return 0.0
@@ -886,6 +888,9 @@ class FuturesCycleStrategist:
             score = move * fit
             if pair == self._last_entry_pair:
                 score *= 0.85
+            # Until equity is larger, de-prefer BTC min-lot vs ETH/SOL/BNB
+            if free < 15000 and "BTC" in pair.upper():
+                score *= 0.88
             ranked.append((score, move, pair, spot, qty, margin_inr, lev))
 
         if now - self._last_scan_log > 30:
@@ -1016,6 +1021,11 @@ class FuturesCycleStrategist:
             return _exit(f"EXIT_TP_PCT: {pair} +{pnl_pct:.2%} pnl=₹{pnl:.0f}")
         if pnl_pct <= -self.stop_loss_pct:
             return _exit(f"EXIT_SL_PCT: {pair} {pnl_pct:.2%} pnl=₹{pnl:.0f}")
+        if self.max_hold_sec > 0 and self._entry_ts > 0 and (now - self._entry_ts) >= self.max_hold_sec:
+            held = now - self._entry_ts
+            return _exit(
+                f"EXIT_TIME: {pair} held={held:.0f}s>=max={self.max_hold_sec:.0f}s pnl=₹{pnl:.0f}"
+            )
         return None
 
     def evaluate(self, spot: float, position: Optional[Position], min_qty: float, pair: Optional[str] = None) -> Optional[HedgeSignal]:
@@ -1200,7 +1210,7 @@ class DataStore:
                 "rubaih:settings",
                 mapping={
                     "free_capital_inr": f"{free_inr:.2f}",
-                    "trade_budget_inr": f"{max(0.0, free_inr) * float(CFG['trading'].get('margin_use_frac', 0.55)):.2f}",
+                    "trade_budget_inr": f"{max(0.0, free_inr) * float(CFG['trading'].get('margin_use_frac', 0.25)):.2f}",
                     "capital_source": source,
                     "locked_margin_inr": f"{locked_margin:.2f}",
                 },
@@ -1388,19 +1398,19 @@ class RubaihBot:
             "max_vega": str(cfg["max_vega"]),
             "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
             "capital_inr": str(cfg.get("capital_inr", 5000)),
-            "margin_use_frac": str(cfg.get("margin_use_frac", 0.55)),
-            "margin_use_max_frac": str(cfg.get("margin_use_max_frac", 0.60)),
+            "margin_use_frac": str(cfg.get("margin_use_frac", 0.25)),
+            "margin_use_max_frac": str(cfg.get("margin_use_max_frac", 0.30)),
             "take_profit_price_pct": str(
-                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.014))
             ),
             "stop_loss_price_pct": str(
-                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.011))
+                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.007))
             ),
-            "take_profit_pct": str(scfg.get("take_profit_pct", 0.022)),
-            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.011)),
-            "max_loss_frac": str(scfg.get("max_loss_frac", 0.12)),
-            "trail_arm_r": str(scfg.get("trail_arm_r", 0.5)),
-            "trail_giveback_r": str(scfg.get("trail_giveback_r", 0.4)),
+            "take_profit_pct": str(scfg.get("take_profit_pct", 0.014)),
+            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.007)),
+            "max_loss_frac": str(scfg.get("max_loss_frac", 0.08)),
+            "trail_arm_r": str(scfg.get("trail_arm_r", 0.35)),
+            "trail_giveback_r": str(scfg.get("trail_giveback_r", 0.30)),
             "leverage": str(cfg.get("leverage", 10)),
             "live_trading": str(self._live).lower(),
             "exchange": "coindcx",
@@ -1415,6 +1425,7 @@ class RubaihBot:
             "take_profit_price_pct", "stop_loss_price_pct",
             "take_profit_pct", "stop_loss_pct",
             "perp_symbol", "margin_currency", "live_trading", "max_delta",
+            "max_drawdown_pct",
         )
         existing = await self.store.rd.hgetall("rubaih:settings")
         merged = dict(existing or {})
@@ -1458,19 +1469,24 @@ class RubaihBot:
                 self._mode = str(defaults["mode"]).strip().lower()
             elif k == "max_delta":
                 self.risk.max_delta = float(defaults["max_delta"])
+            elif k == "max_drawdown_pct":
+                self.risk.max_dd = float(defaults["max_drawdown_pct"])
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
         self.cycle.take_profit_price_pct = float(
-            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.022))
+            scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.014))
         )
         self.cycle.stop_loss_price_pct = float(
-            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.011))
+            scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.007))
         )
         self.cycle.take_profit_pct = self.cycle.take_profit_price_pct
         self.cycle.stop_loss_pct = self.cycle.stop_loss_price_pct
-        self.cycle.max_loss_frac = float(scfg.get("max_loss_frac", 0.12))
-        self.cycle.trail_arm_r = float(scfg.get("trail_arm_r", 0.5))
-        self.cycle.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.4))
+        self.cycle.max_loss_frac = float(scfg.get("max_loss_frac", 0.08))
+        self.cycle.trail_arm_r = float(scfg.get("trail_arm_r", 0.35))
+        self.cycle.trail_giveback_r = float(scfg.get("trail_giveback_r", 0.30))
         self.cycle.trail_giveback_of_peak = float(scfg.get("trail_giveback_of_peak", 0.25))
+        self.cycle.max_hold_sec = float(scfg.get("max_hold_sec", 14400))
+        self.cycle.entry_cooldown = float(scfg.get("entry_cooldown_sec", 150))
+        self.cycle.entry_move_pct = float(scfg.get("entry_move_pct", 0.0025))
         # App shows CoinDCX-style ROE (what you see as 10/20/30 on exchange)
         lev = max(1, int(self._leverage or 10))
         tp_px = self.cycle.take_profit_price_pct
@@ -1990,8 +2006,8 @@ class RubaihBot:
         print(f"[RUBAIH] LIVE_TRADING: {'ON — real orders' if self._live else 'OFF — dry-run only'}")
         print(
             f"[RUBAIH] Capital fallback: ₹{CFG['trading'].get('capital_inr', '?')} | "
-            f"margin/trade: {CFG['trading'].get('margin_use_frac', 0.55):.0%}"
-            f"–{CFG['trading'].get('margin_use_max_frac', 0.60):.0%} of free @ {self._leverage}x"
+            f"margin/trade: {CFG['trading'].get('margin_use_frac', 0.25):.0%}"
+            f"–{CFG['trading'].get('margin_use_max_frac', 0.30):.0%} of free @ {self._leverage}x"
         )
         print(f"[RUBAIH] Margin currency: {MARGIN_CCY}")
         await self.store.rd.hset(
@@ -2530,6 +2546,30 @@ class RubaihBot:
                 or bool(result.get("error"))
             )
 
+        def _fill_price(result, fallback: float) -> float:
+            """Prefer exchange avg fill over book mid when create response includes it."""
+            if not isinstance(result, dict):
+                return fallback
+            candidates = [result]
+            for key in ("order", "data", "result"):
+                nested = result.get(key)
+                if isinstance(nested, dict):
+                    candidates.append(nested)
+                elif isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                    candidates.append(nested[0])
+            orders = result.get("orders")
+            if isinstance(orders, list) and orders and isinstance(orders[0], dict):
+                candidates.append(orders[0])
+            for obj in candidates:
+                for key in ("avg_price", "average_price", "price", "avgPrice"):
+                    try:
+                        px = float(obj.get(key) or 0)
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    if px > 0:
+                        return px
+            return fallback
+
         async def _place(qty: float) -> bool:
             if qty <= 0 or qty < perp_prod.min_quantity:
                 await self._log(f"[HEDGE] Size {qty} below min {perp_prod.min_quantity}")
@@ -2568,8 +2608,13 @@ class RubaihBot:
                         m = self.cycle.trade_margin_budget()
                     await self.note_insufficient_funds(m)
                 return False
-            await self.store.save_hedge(signal, spot, size=qty)
-            self._apply_dry_fill(perp_symbol, side, qty, spot)
+            fill_px = _fill_price(result, spot)
+            if abs(fill_px - spot) / max(spot, 1e-9) > 0.0005:
+                await self._log(
+                    f"[HEDGE] Fill price {fill_px:.4f} (mid was {spot:.4f}) — arming TP/SL on fill"
+                )
+            await self.store.save_hedge(signal, fill_px, size=qty)
+            self._apply_dry_fill(perp_symbol, side, qty, fill_px)
             return True
 
         if size > cfg["max_order_size_btc"]:
@@ -2705,8 +2750,8 @@ class RubaihBot:
         print(f"  Scan: {'ON' if self._scan_enabled else 'OFF'} ({len(self._scan_pairs)} pairs)")
         print(f"  Active pair: {self._active_pair}")
         print(
-            f"  Size: {CFG['trading'].get('margin_use_frac', 0.55):.0%}"
-            f"–{CFG['trading'].get('margin_use_max_frac', 0.60):.0%} of free margin @ {self._leverage}x"
+            f"  Size: {CFG['trading'].get('margin_use_frac', 0.25):.0%}"
+            f"–{CFG['trading'].get('margin_use_max_frac', 0.30):.0%} of free margin @ {self._leverage}x"
         )
         print(f"  Free ≈ ₹{self.cycle.free_capital_inr:.0f} (budget ₹{self.cycle.trade_margin_budget():.0f})")
         print(f"  AI: {'ENABLED' if self._ai_enabled else 'DISABLED'}")

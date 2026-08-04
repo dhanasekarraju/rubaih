@@ -1,5 +1,6 @@
 # Rubaih — CoinDCX INR-M futures cycle
 # Sizing & risk are FRACTIONS of free capital / trade margin — not fixed ₹ amounts.
+# Capital-survival defaults: scale cleanly from ~₹1k probe → ₹20k+.
 
 exchange:
   name: "coindcx"
@@ -11,8 +12,9 @@ exchange:
   taker_fee: 0.00075
 
 trading:
-  underlying: "BTC"
-  perp_symbol: "B-BTC_USDT"
+  # Default active = ETH (smaller min-lot vs BTC on small capital). Scan still ranks by move.
+  underlying: "ETH"
+  perp_symbol: "B-ETH_USDT"
   mode: futures_cycle
 
   # Fallback only for dry-run. LIVE uses wallet API or RUBAIH_FREE_CAPITAL_INR.
@@ -20,17 +22,17 @@ trading:
   leverage: 10
   usdt_inr: 87
 
-  # Use 50–60% of *available* futures capital per trade
-  margin_use_frac: 0.55
-  margin_use_max_frac: 0.60
+  # Hard cap risk per trade — engine never bumps min-lot past max_frac×free
+  margin_use_frac: 0.25
+  margin_use_max_frac: 0.30
 
   scan_enabled: true
-  # Majors only — do NOT auto-add meme/illiquid pairs (CHIP etc.)
+  # Majors only — ETH first (min-lot friendly). Do NOT auto-add meme/illiquid pairs.
   scan_pairs:
-    - B-BTC_USDT
     - B-ETH_USDT
     - B-SOL_USDT
     - B-BNB_USDT
+    - B-BTC_USDT
   scan_fill_extras: false
   scan_max_pairs: 4
   scan_interval_sec: 5
@@ -38,7 +40,8 @@ trading:
   delta_threshold: 0.0005
   max_delta: 100.0
   max_vega: 100.0
-  max_drawdown_pct: 0.15
+  # Tighter probe kill — ~8–10% of account from peak
+  max_drawdown_pct: 0.10
 
   min_hedge_interval_sec: 45
   cost_buffer_multiplier: 1.2
@@ -47,26 +50,26 @@ trading:
   twap_interval_sec: 5
 
   strategy:
-    entry_cooldown_sec: 75
+    entry_cooldown_sec: 150
     momentum_lookback: 24
-    entry_move_pct: 0.001
-    # Faster exits for majors: TP +2.20% (ROE≈+22% @10x / +11% @5x).
-    take_profit_price_pct: 0.022
-    # SL −1.10% → TP:SL = 2:1 (ROE≈−11% @10x / −5.5% @5x).
-    stop_loss_price_pct: 0.011
-    # Legacy fallbacks
-    take_profit_pct: 0.022
-    stop_loss_pct: 0.011
+    # Raise bar vs noise (was 0.1%)
+    entry_move_pct: 0.0025
+    # Fee-realistic ~2R: TP +1.40% / SL −0.70% → ROE ≈ +14% / −7% @10x
+    take_profit_price_pct: 0.014
+    stop_loss_price_pct: 0.007
+    # Legacy fallbacks (same as price pct)
+    take_profit_pct: 0.014
+    stop_loss_pct: 0.007
     # CoinDCX INR-M 422s on attached TP/SL — bot exits only
     exchange_attach_tpsl: false
-    # 0 disables time exits. Hold until TP, SL, max-loss, or profitable trail.
-    max_hold_sec: 0
+    # Time stop: 4h — no bagging until soft SL alone
+    max_hold_sec: 14400
     allow_short: false
-    # Above −1.1% @10x (~11% ROE) so soft SL hits first.
-    max_loss_frac: 0.12
-    # Arm trail after 0.5R (fee-safe) so winners can lock earlier than full TP.
-    trail_arm_r: 0.5
-    trail_giveback_r: 0.4
+    # Soft max-loss under SL (~7% ROE @10x) so it can fire
+    max_loss_frac: 0.08
+    # Bank early once fee-safe
+    trail_arm_r: 0.35
+    trail_giveback_r: 0.30
     trail_giveback_of_peak: 0.25
 risk:
   kill_switch_on_drawdown: true
