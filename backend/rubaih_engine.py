@@ -14,11 +14,12 @@ import asyncio
 import hashlib
 import hmac
 import math
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -32,6 +33,7 @@ import yaml
 from scipy.stats import norm
 
 from openrouter_ai import OpenRouterAI, AIDecision, ai_configured
+from cmd_bus import verify_command, filter_settings
 
 # ==============================================================================
 # CONFIG
@@ -54,6 +56,7 @@ MARGIN_CCY = CFG["exchange"].get("margin_currency", "USDT")
 API_KEY = _env_secret("COINDCX_API_KEY")
 API_SECRET = _env_secret("COINDCX_API_SECRET")
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
+CMD_SECRET = (os.getenv("RUBAIH_API_TOKEN") or "").strip()
 # Manual free-futures INR when CoinDCX wallet endpoints 404 (set to YOUR Futures wallet ₹)
 try:
     FREE_CAPITAL_INR_ENV = float(os.getenv("RUBAIH_FREE_CAPITAL_INR") or os.getenv("FREE_CAPITAL_INR") or 0)
@@ -349,14 +352,18 @@ class CoinDCXClient:
         leverage: Optional[int] = None,
         take_profit_price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
-    ) -> Dict:
+        client_order_id: Optional[str] = None,
+    ) -> Any:
         """
         Place futures market/limit order.
         NOTE: Never attach take_profit_price / stop_loss_price — CoinDCX INR-M returns
         422 "Please enter correct values for TP / SL". Bot manages TP/SL after fill.
         (Args kept for API compatibility but intentionally ignored.)
+
+        Success payload is typically a *list* of order objects (id, status,
+        remaining_quantity, avg_price, …) — not a bare dict.
         """
-        order = {
+        order: Dict[str, Any] = {
             "side": side.value,
             "pair": pair,
             "order_type": "market_order" if order_type == "market" else "limit_order",
@@ -368,6 +375,9 @@ class CoinDCXClient:
         }
         if leverage is not None:
             order["leverage"] = int(leverage)
+        if client_order_id:
+            # Spot docs require this; futures accepts when present (idempotency key).
+            order["client_order_id"] = str(client_order_id)
         # Intentionally do NOT send take_profit_price / stop_loss_price (INR-M 422).
         if order_type != "market":
             order["time_in_force"] = "good_till_cancel"
@@ -376,6 +386,196 @@ class CoinDCXClient:
             "/exchange/v1/derivatives/futures/orders/create",
             {"order": order},
         )
+
+    async def list_futures_orders(
+        self,
+        status: str = "open,filled,cancelled,partially_filled,partially_cancelled",
+        side: Optional[str] = None,
+        page: int = 1,
+        size: int = 50,
+    ) -> List[Dict]:
+        """List futures orders (used to poll fill state by order id)."""
+        if not self._auth_ok:
+            return []
+        body: Dict[str, Any] = {
+            "status": status,
+            "page": str(page),
+            "size": str(size),
+            "margin_currency_short_name": [self.margin],
+        }
+        if side:
+            body["side"] = side
+        data = await self._signed_post("/exchange/v1/derivatives/futures/orders", body)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            rows = data.get("data") or data.get("result") or data.get("orders") or []
+            if isinstance(rows, list):
+                return [x for x in rows if isinstance(x, dict)]
+        return []
+
+    async def get_order_by_id(self, order_id: str) -> Optional[Dict]:
+        """Find one futures order by id across recent status buckets."""
+        if not order_id:
+            return None
+        oid = str(order_id)
+        rows = await self.list_futures_orders(
+            status="open,filled,cancelled,partially_filled,partially_cancelled,initial",
+            size=50,
+        )
+        for o in rows:
+            if str(o.get("id") or "") == oid:
+                return o
+            if str(o.get("client_order_id") or "") == oid:
+                return o
+        return None
+
+    @staticmethod
+    def normalize_order_payload(result: Any) -> Dict:
+        """Create may return a list[order] or wrapped dict / error dict."""
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    return item
+            return {}
+        if not isinstance(result, dict):
+            return {}
+        if result.get("status") == "error" or result.get("error"):
+            return result
+        for key in ("order", "data", "result"):
+            nested = result.get(key)
+            if isinstance(nested, dict):
+                return nested
+            if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                return nested[0]
+        orders = result.get("orders")
+        if isinstance(orders, list) and orders and isinstance(orders[0], dict):
+            return orders[0]
+        return result
+
+    @staticmethod
+    def filled_qty_from_order(order: Dict, requested: float = 0.0) -> float:
+        """Exchange-true filled size from total/remaining/cancelled."""
+        if not isinstance(order, dict):
+            return 0.0
+        try:
+            total = float(order.get("total_quantity") or requested or 0)
+        except (TypeError, ValueError):
+            total = float(requested or 0)
+        try:
+            rem = float(order.get("remaining_quantity") or 0)
+        except (TypeError, ValueError):
+            rem = 0.0
+        try:
+            canc = float(order.get("cancelled_quantity") or 0)
+        except (TypeError, ValueError):
+            canc = 0.0
+        filled = total - rem - canc
+        if filled < 0 and total > 0:
+            filled = max(0.0, total - rem)
+        st = str(order.get("status") or "").lower()
+        if st == "filled" and filled <= 0 and total > 0:
+            filled = total
+        return max(0.0, filled)
+
+    async def resolve_order_fill(
+        self,
+        order_id: str,
+        requested_qty: float,
+        timeout_sec: float = 12.0,
+        poll_sec: float = 0.4,
+        initial: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """
+        Poll until order reaches a terminal-ish state; return filled qty + avg price.
+        Never invent a full fill — returns filled_qty=0 on failure/timeout with no evidence.
+        """
+        terminal = {
+            "filled",
+            "cancelled",
+            "rejected",
+            "partially_cancelled",
+        }
+        last = dict(initial or {})
+        deadline = time.time() + max(1.0, timeout_sec)
+        while True:
+            order: Optional[Dict] = None
+            if order_id:
+                found = await self.get_order_by_id(order_id)
+                if found:
+                    order = found
+                    last = found
+            elif last:
+                order = last
+            if order:
+                st = str(order.get("status") or "").lower()
+                filled = self.filled_qty_from_order(order, requested_qty)
+                try:
+                    avg = float(order.get("avg_price") or 0)
+                except (TypeError, ValueError):
+                    avg = 0.0
+                fx = 0.0
+                try:
+                    fx = float(order.get("settlement_currency_conversion_price") or 0)
+                except (TypeError, ValueError):
+                    fx = 0.0
+                if st == "filled" or (
+                    filled + 1e-12 >= float(requested_qty or 0) > 0
+                    and st not in ("open", "initial", "untriggered", "pending")
+                ):
+                    return {
+                        "ok": filled > 0,
+                        "filled_qty": filled if filled > 0 else float(requested_qty or 0),
+                        "avg_price": avg,
+                        "status": st,
+                        "fx": fx,
+                        "order": order,
+                        "terminal": True,
+                    }
+                if st in terminal:
+                    return {
+                        "ok": filled > 0,
+                        "filled_qty": filled,
+                        "avg_price": avg,
+                        "status": st,
+                        "fx": fx,
+                        "order": order,
+                        "terminal": True,
+                    }
+                # partially_filled / open / initial — keep polling
+                if filled > 0 and time.time() >= deadline:
+                    return {
+                        "ok": True,
+                        "filled_qty": filled,
+                        "avg_price": avg,
+                        "status": st or "partial_timeout",
+                        "fx": fx,
+                        "order": order,
+                        "terminal": False,
+                    }
+            if time.time() >= deadline:
+                filled = self.filled_qty_from_order(last, requested_qty) if last else 0.0
+                avg = 0.0
+                fx = 0.0
+                if last:
+                    try:
+                        avg = float(last.get("avg_price") or 0)
+                    except (TypeError, ValueError):
+                        avg = 0.0
+                    try:
+                        fx = float(last.get("settlement_currency_conversion_price") or 0)
+                    except (TypeError, ValueError):
+                        fx = 0.0
+                return {
+                    "ok": filled > 0,
+                    "filled_qty": filled,
+                    "avg_price": avg,
+                    "status": str((last or {}).get("status") or "timeout"),
+                    "fx": fx,
+                    "order": last or {},
+                    "terminal": False,
+                }
+            await asyncio.sleep(poll_sec)
 
     async def cancel_all_orders(self) -> Dict:
         return await self._signed_post(
@@ -1319,6 +1519,19 @@ class RubaihBot:
         self._margin_locked = 0.0
         self._capital_source = "unset"
         self._ledger_seeded = False
+        # Serializes all mutations of _dry_pos + free/locked capital across
+        # main_loop, sync_positions, fills, and ledger adjustments.
+        self._state_lock = asyncio.Lock()
+        # Live fill accepted but exchange inventory not yet confirmed.
+        self._pending_settle = False
+        # Consecutive exchange-flat readings required before ghost-close credit.
+        self._flat_confirm_count = 0
+        self._flat_confirms_needed = 2
+        # Do not treat exchange as flat (or credit capital) inside this window
+        # after a local fill — CoinDCX position feeds lag under load.
+        self._settle_grace_sec = 30.0
+        # Flatten order failed or unconfirmed — position remains active risk.
+        self._active_risk = False
 
     def _leverage_for(self, pair: Optional[str] = None) -> int:
         """Config leverage capped by instrument max (e.g. SOL often 5x)."""
@@ -1549,9 +1762,7 @@ class RubaihBot:
             self.risk.max_vega = float(data["max_vega"])
         if "max_drawdown_pct" in data:
             self.risk.max_dd = float(data["max_drawdown_pct"])
-        if "capital_inr" in data:
-            self.cycle.capital_inr = float(data["capital_inr"])
-            self.cycle.set_free_capital(self.cycle.capital_inr)
+        # capital_inr intentionally NOT applied from command bus — prevents free-capital poison
         if "margin_use_frac" in data:
             self.cycle.margin_use_frac = float(data["margin_use_frac"])
         if "margin_use_max_frac" in data:
@@ -1681,7 +1892,8 @@ class RubaihBot:
             return best_from_list(payload)
         return 0.0
 
-    async def _publish_capital(self, free: float, source: str):
+    async def _publish_capital_locked(self, free: float, source: str):
+        """Mutate free capital. Caller MUST hold self._state_lock."""
         self.cycle.set_free_capital(free)
         self._capital_live_ok = free > 0
         self._capital_source = source
@@ -1690,8 +1902,12 @@ class RubaihBot:
         except Exception:
             pass
 
-    def _ledger_adjust_sync(self, delta: float, reason: str):
-        """Update free capital in-memory after fills (persisted async)."""
+    async def _publish_capital(self, free: float, source: str):
+        async with self._state_lock:
+            await self._publish_capital_locked(free, source)
+
+    async def _ledger_adjust_locked(self, delta: float, reason: str):
+        """Update free capital in-memory + await Redis persist. Lock MUST be held."""
         new_free = max(0.0, float(self.cycle.free_capital_inr) + float(delta))
         self.cycle.set_free_capital(new_free)
         self._capital_live_ok = True
@@ -1701,12 +1917,9 @@ class RubaihBot:
             f"budget=₹{self.cycle.trade_margin_budget():.0f} locked=₹{self._margin_locked:.0f}"
         )
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(
-                self.store.save_capital_ledger(new_free, "ledger", self._margin_locked)
-            )
-        except RuntimeError:
-            pass
+            await self.store.save_capital_ledger(new_free, "ledger", self._margin_locked)
+        except Exception as e:
+            print(f"[CAPITAL] ledger persist failed: {e}")
 
     async def _refresh_free_capital(self, force: bool = False):
         """
@@ -1714,6 +1927,9 @@ class RubaihBot:
         1) CoinDCX wallet APIs when they work (authoritative)
         2) Else auto ledger (updated after every fill) — no VPS edits per trade
         3) Seed once from env/config only if ledger empty
+
+        Exchange I/O runs outside the state lock; publishes run under it.
+        While a fill is pending settle, only exchange-sourced balances may overwrite.
         """
         now = time.time()
         last = getattr(self, "_last_capital_refresh", 0.0)
@@ -1743,16 +1959,22 @@ class RubaihBot:
             print(f"[CAPITAL] exchange refresh failed: {e}")
 
         if free > 0:
-            if source.startswith("exchange:") and free < 200 and MARGIN_CCY.upper() == "INR":
-                converted = free * float(self.cycle.usdt_inr)
-                if converted > free * 2:
+            async with self._state_lock:
+                # Tight heuristic only: tiny USDT-scale residuals on INR wallets.
+                # Prefer settlement_currency_conversion_price from fills for FX.
+                if (
+                    source.startswith("exchange:")
+                    and free < 50
+                    and MARGIN_CCY.upper() == "INR"
+                    and free * float(self.cycle.usdt_inr) > 500
+                ):
+                    converted = free * float(self.cycle.usdt_inr)
                     print(
-                        f"[CAPITAL] exchange {free:.4f} looks USDT-scale → ₹{converted:.0f}"
+                        f"[CAPITAL] exchange {free:.4f} looks USDT-scale → ₹{converted:.0f} "
+                        f"@ usdt_inr={self.cycle.usdt_inr:.2f}"
                     )
                     free = converted
-            # If we have a locked position, exchange "available" is already net of margin;
-            # our ledger free is also "available to open". Trust exchange available as free.
-            await self._publish_capital(free, source)
+                await self._publish_capital_locked(free, source)
             if force or now - getattr(self, "_last_capital_log", 0.0) > 60:
                 self._last_capital_log = now
                 print(
@@ -1762,26 +1984,37 @@ class RubaihBot:
             return
 
         # --- No exchange balance: keep / restore auto ledger ---
-        if self.cycle.free_capital_inr > 0 and (
-            self._capital_live_ok or self._capital_source == "ledger"
-        ):
-            await self._publish_capital(self.cycle.free_capital_inr, "ledger")
-            if force or now - getattr(self, "_last_capital_log", 0.0) > 90:
-                self._last_capital_log = now
+        async with self._state_lock:
+            # Do not invent capital from ledger while inventory is still settling
+            if self._pending_settle or self._active_risk:
                 print(
-                    f"[CAPITAL] ledger free=₹{self.cycle.free_capital_inr:.0f} "
-                    f"(auto-updates after each trade; wallet API still 404)"
+                    "[CAPITAL] skip ledger restore — pending settle / active risk "
+                    "(waiting for exchange confirmation)"
                 )
-            return
+                return
+            if self.cycle.free_capital_inr > 0 and (
+                self._capital_live_ok or self._capital_source == "ledger"
+            ):
+                await self._publish_capital_locked(self.cycle.free_capital_inr, "ledger")
+                if force or now - getattr(self, "_last_capital_log", 0.0) > 90:
+                    self._last_capital_log = now
+                    print(
+                        f"[CAPITAL] ledger free=₹{self.cycle.free_capital_inr:.0f} "
+                        f"(auto-updates after each trade; wallet API still 404)"
+                    )
+                return
 
         ledger = await self.store.load_capital_ledger()
         ledger_free = float(ledger.get("free_inr") or 0)
         if ledger_free > 0:
-            self._margin_locked = float(ledger.get("locked_margin") or 0)
-            await self._publish_capital(ledger_free, "ledger:redis")
+            async with self._state_lock:
+                if self._pending_settle or self._active_risk:
+                    return
+                self._margin_locked = float(ledger.get("locked_margin") or 0)
+                await self._publish_capital_locked(ledger_free, "ledger:redis")
             print(
                 f"[CAPITAL] restored ledger free=₹{ledger_free:.0f} "
-                f"locked=₹{self._margin_locked:.0f}"
+                f"locked=₹{float(ledger.get('locked_margin') or 0):.0f}"
             )
             return
 
@@ -1791,11 +2024,14 @@ class RubaihBot:
             if seed <= 0 and not self._live:
                 seed = float(self.cycle.capital_inr or 0)
             if seed > 0:
-                self._ledger_seeded = True
-                await self._publish_capital(
-                    seed,
-                    "seed:env" if FREE_CAPITAL_INR_ENV > 0 else "seed:config",
-                )
+                async with self._state_lock:
+                    if self._pending_settle or self._active_risk:
+                        return
+                    self._ledger_seeded = True
+                    await self._publish_capital_locked(
+                        seed,
+                        "seed:env" if FREE_CAPITAL_INR_ENV > 0 else "seed:config",
+                    )
                 print(
                     f"[CAPITAL] seeded free=₹{seed:.0f} once — will auto-track after trades. "
                     f"Set RUBAIH_FREE_CAPITAL_INR only for first seed if wallet API 404s."
@@ -1803,7 +2039,8 @@ class RubaihBot:
                 return
 
         if self._live:
-            self._capital_live_ok = False
+            async with self._state_lock:
+                self._capital_live_ok = False
             if now - getattr(self, "_last_capital_fail_log", 0.0) > 60:
                 self._last_capital_fail_log = now
                 print(
@@ -1816,22 +2053,23 @@ class RubaihBot:
 
     async def note_insufficient_funds(self, attempted_margin: float = 0.0):
         """After CoinDCX Insufficient funds — shrink ledger immediately."""
-        cur = max(self.cycle.free_capital_inr, 0.0)
-        if attempted_margin > 0:
-            new_free = max(50.0, attempted_margin * 0.65 / max(self.cycle.margin_use_frac, 0.1))
-            new_free = min(new_free, cur * 0.65) if cur > 0 else new_free
-        else:
-            new_free = max(50.0, cur * 0.55) if cur > 0 else 200.0
-        self._margin_locked = 0.0
-        await self._publish_capital(new_free, "ledger:insuff_cut")
-        self.cycle._last_signal = time.time()
-        print(
-            f"[CAPITAL] Insufficient funds → ledger cut to ₹{new_free:.0f} "
-            f"(budget ₹{self.cycle.trade_margin_budget():.0f})"
-        )
+        async with self._state_lock:
+            cur = max(self.cycle.free_capital_inr, 0.0)
+            if attempted_margin > 0:
+                new_free = max(50.0, attempted_margin * 0.65 / max(self.cycle.margin_use_frac, 0.1))
+                new_free = min(new_free, cur * 0.65) if cur > 0 else new_free
+            else:
+                new_free = max(50.0, cur * 0.55) if cur > 0 else 200.0
+            self._margin_locked = 0.0
+            await self._publish_capital_locked(new_free, "ledger:insuff_cut")
+            self.cycle._last_signal = time.time()
+            print(
+                f"[CAPITAL] Insufficient funds → ledger cut to ₹{new_free:.0f} "
+                f"(budget ₹{self.cycle.trade_margin_budget():.0f})"
+            )
 
     async def command_listener(self):
-        """Honor kill-switch / settings from authenticated API. Reconnects if Redis drops."""
+        """Honor signed kill-switch / settings from authenticated API. Reconnects if Redis drops."""
         while self._running:
             pubsub = None
             try:
@@ -1839,7 +2077,7 @@ class RubaihBot:
                     await self.store.connect()
                 pubsub = self.store.rd.pubsub()
                 await pubsub.subscribe("rubaih:command")
-                print("[CMD] Listening on rubaih:command")
+                print("[CMD] Listening on rubaih:command (HMAC required)")
                 while self._running:
                     try:
                         message = await pubsub.get_message(
@@ -1855,6 +2093,14 @@ class RubaihBot:
                         payload = json.loads(message["data"])
                     except Exception:
                         continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if not CMD_SECRET or not verify_command(CMD_SECRET, payload):
+                        print(
+                            "[CMD] REJECTED unsigned/invalid command — "
+                            "ignoring (require HMAC from API)"
+                        )
+                        continue
                     cmd = payload.get("command")
                     if cmd == "KILL_SWITCH":
                         reason = f"API_KILL_SWITCH from {payload.get('source', 'unknown')}"
@@ -1865,7 +2111,10 @@ class RubaihBot:
                         await self._emergency_unwind()
                         return
                     if cmd == "UPDATE_SETTINGS":
-                        data = payload.get("data") or {}
+                        data = filter_settings(payload.get("data") or {})
+                        if not data:
+                            print("[CMD] UPDATE_SETTINGS empty after allowlist filter")
+                            continue
                         await self._apply_settings(data)
                         await self.store.rd.hset(
                             "rubaih:settings", mapping={k: str(v) for k, v in data.items()}
@@ -2222,37 +2471,100 @@ class RubaihBot:
             position_side=side,
         )
 
+    async def _exchange_active_qty(self, pair: str) -> Optional[float]:
+        """Return abs(active_pos) for pair, 0 if flat, None if positions API failed."""
+        if not self.client or not self.client._auth_ok:
+            return None
+        try:
+            raw = await self.client.get_positions() or []
+        except Exception as e:
+            print(f"[SYNC] positions fetch failed: {e}")
+            return None
+        saw = False
+        for rp in raw:
+            if rp.get("pair", "") != pair:
+                continue
+            saw = True
+            return abs(float(rp.get("active_pos", 0) or 0))
+        # Pair absent from feed — treat as flat only if API returned a list
+        return 0.0 if isinstance(raw, list) else None
+
+    async def _confirm_exchange_flat(
+        self, pair: str, reads: int = 3, delay_sec: float = 1.2
+    ) -> bool:
+        """Require consecutive flat readings before trusting exchange as settled flat."""
+        if not pair:
+            return False
+        ok = 0
+        for i in range(max(1, reads)):
+            qty = await self._exchange_active_qty(pair)
+            if qty is None:
+                print(f"[SYNC] flat-confirm {i + 1}/{reads}: positions API error — not flat")
+                return False
+            if qty > 1e-12:
+                print(f"[SYNC] flat-confirm {i + 1}/{reads}: still open qty={qty}")
+                return False
+            ok += 1
+            if i < reads - 1:
+                await asyncio.sleep(delay_sec)
+        print(f"[SYNC] flat-confirm OK for {pair} ({ok}/{reads})")
+        return True
+
     async def sync_positions(self):
         """Sync positions for scan allowlist only — never ingest SLX / other books."""
         while self._running:
             try:
                 allow = set(self._scan_pairs) | {self._active_pair}
 
+                # Snapshot local SoT under lock (mutations happen later under lock)
+                async with self._state_lock:
+                    local = self._dry_pos
+                    local_size = float(local.size) if local and local.size > 0 else 0.0
+                    local_symbol = local.symbol if local and local_size > 0 else None
+
                 # futures_cycle: local cycle position is source of truth for dashboard
-                if self._mode == "futures_cycle" and self._dry_pos and self._dry_pos.size > 0:
-                    spot = self._mid_for(self._dry_pos.symbol)
-                    if spot > 0 and self._dry_pos.entry_price > 0:
-                        self._dry_pos.unrealized_pnl = self._pnl_inr(
-                            self._dry_pos.entry_price, spot, self._dry_pos.size, self._dry_pos.side or "buy",
-                        )
-                    self.portfolio.update_positions([self._dry_pos])
-                    await self._set_active_pair(self._dry_pos.symbol)
-                    # Live: overlay exchange; clear ghost if exchange is flat
+                if self._mode == "futures_cycle" and local_symbol and local_size > 0:
+                    spot = self._mid_for(local_symbol)
+                    async with self._state_lock:
+                        if self._dry_pos and self._dry_pos.symbol == local_symbol:
+                            if spot > 0 and self._dry_pos.entry_price > 0:
+                                self._dry_pos.unrealized_pnl = self._pnl_inr(
+                                    self._dry_pos.entry_price,
+                                    spot,
+                                    self._dry_pos.size,
+                                    self._dry_pos.side or "buy",
+                                )
+                            self.portfolio.update_positions([self._dry_pos])
+                    await self._set_active_pair(local_symbol)
+                    # Live: overlay exchange; ghost-close only after structural settle
                     if self._live and self.client and self.client._auth_ok:
                         try:
                             raw = await self.client.get_positions() or []
                             open_pairs = set()
                             matched_flat = False
+                            matched_open = False
+                            mark = 0.0
+                            avg = 0.0
+                            active = 0.0
                             for rp in raw:
                                 pair = rp.get("pair", "")
-                                active = float(rp.get("active_pos", 0) or 0)
-                                if abs(active) > 0 and pair:
+                                act = float(rp.get("active_pos", 0) or 0)
+                                if abs(act) > 0 and pair:
                                     open_pairs.add(pair)
-                                if pair != self._dry_pos.symbol:
+                                if pair != local_symbol:
                                     continue
                                 mark = float(rp.get("mark_price", 0) or 0)
                                 avg = float(rp.get("avg_price", 0) or 0)
-                                if abs(active) > 0:
+                                active = act
+                                if abs(act) > 0:
+                                    matched_open = True
+                                else:
+                                    matched_flat = True
+
+                            async with self._state_lock:
+                                if not self._dry_pos or self._dry_pos.symbol != local_symbol:
+                                    pass
+                                elif matched_open:
                                     self._dry_pos.size = abs(active)
                                     self._dry_pos.side = "buy" if active > 0 else "sell"
                                     if avg > 0:
@@ -2262,34 +2574,73 @@ class RubaihBot:
                                             avg, mark, abs(active), self._dry_pos.side,
                                         )
                                     self.portfolio.update_positions([self._dry_pos])
+                                    # Exchange inventory matches — settle complete
+                                    self._pending_settle = False
+                                    self._flat_confirm_count = 0
+                                    if self._active_risk and abs(active) > 0:
+                                        # Still open after failed flatten — keep flag
+                                        pass
                                 else:
-                                    matched_flat = True
-                            ghost = matched_flat or (
-                                self._dry_pos.symbol not in open_pairs
-                                and time.time() - self._last_fill_ts > 12
-                            )
-                            if ghost:
-                                closed_pair = self._dry_pos.symbol
-                                last_pnl = float(self._dry_pos.unrealized_pnl or 0)
-                                release = float(
-                                    self._margin_locked or self.cycle._margin_used or 0
-                                )
-                                print(
-                                    f"[SYNC] Exchange flat for {closed_pair} — "
-                                    f"manual/external close detected; clearing local trade "
-                                    f"(pnl≈₹{last_pnl:.0f} release≈₹{release:.0f})"
-                                )
-                                self._dry_pos = None
-                                self.cycle.clear_trade()
-                                self._last_flatten_ts = time.time()
-                                self._margin_locked = 0.0
-                                # Best-effort ledger unlock (mark PnL; no exit fee known)
-                                self._ledger_adjust_sync(
-                                    release + last_pnl,
-                                    f"EXTERNAL_CLOSE {closed_pair} pnl≈₹{last_pnl:.0f}",
-                                )
-                                await self.store.save_trade_plan({})
-                                self.portfolio.update_positions([])
+                                    ghost_candidate = matched_flat or (
+                                        local_symbol not in open_pairs
+                                    )
+                                    age = time.time() - self._last_fill_ts
+                                    if not ghost_candidate:
+                                        self._flat_confirm_count = 0
+                                    elif self._pending_settle:
+                                        self._flat_confirm_count = 0
+                                        print(
+                                            f"[SYNC] defer ghost-close {local_symbol} — "
+                                            f"fill pending exchange settle"
+                                        )
+                                    elif age < self._settle_grace_sec:
+                                        self._flat_confirm_count = 0
+                                        print(
+                                            f"[SYNC] defer ghost-close {local_symbol} — "
+                                            f"settle grace {age:.0f}/{self._settle_grace_sec:.0f}s"
+                                        )
+                                    else:
+                                        self._flat_confirm_count += 1
+                                        need = self._flat_confirms_needed
+                                        if self._flat_confirm_count < need:
+                                            print(
+                                                f"[SYNC] flat reading "
+                                                f"{self._flat_confirm_count}/{need} for "
+                                                f"{local_symbol} — no capital credit yet"
+                                            )
+                                        else:
+                                            # Structurally settled flat — safe to clear + credit
+                                            closed_pair = self._dry_pos.symbol
+                                            last_pnl = float(
+                                                self._dry_pos.unrealized_pnl or 0
+                                            )
+                                            release = float(self._margin_locked or 0)
+                                            print(
+                                                f"[SYNC] Exchange flat confirmed for "
+                                                f"{closed_pair} — external close; "
+                                                f"clearing SoT (pnl≈₹{last_pnl:.0f} "
+                                                f"release≈₹{release:.0f})"
+                                            )
+                                            self._dry_pos = None
+                                            self.cycle.clear_trade()
+                                            self._last_flatten_ts = time.time()
+                                            self._margin_locked = 0.0
+                                            self._pending_settle = False
+                                            self._flat_confirm_count = 0
+                                            self._active_risk = False
+                                            # Credit only still-locked margin (never
+                                            # double-pay if an exit already unlocked).
+                                            credit = release + (
+                                                last_pnl if release > 0 else 0.0
+                                            )
+                                            if abs(credit) > 1e-9:
+                                                await self._ledger_adjust_locked(
+                                                    credit,
+                                                    f"EXTERNAL_CLOSE {closed_pair} "
+                                                    f"pnl≈₹{last_pnl:.0f}",
+                                                )
+                                            await self.store.save_trade_plan({})
+                                            self.portfolio.update_positions([])
                         except Exception as e:
                             print(f"[SYNC] live overlay: {e}")
                     # Faster poll while holding so CoinDCX manual closes are noticed sooner
@@ -2331,30 +2682,59 @@ class RubaihBot:
                 if len(positions) > 1:
                     positions = positions[:1]
                 # Avoid resurrecting a just-flattened position from exchange lag
-                if positions and time.time() - self._last_flatten_ts < 20:
+                async with self._state_lock:
+                    flatten_recent = time.time() - self._last_flatten_ts < 20
+                    flat_local = not (self._dry_pos and self._dry_pos.size > 0)
+                if positions and flatten_recent:
                     positions = []
                 if positions:
                     await self._set_active_pair(positions[0].symbol)
-                    # Mirror into cycle tracker so exits/dashboard stay consistent
-                    if self._mode == "futures_cycle":
-                        self._dry_pos = positions[0]
-                        if self.cycle._tp_price <= 0 or self.cycle._plan_pair != positions[0].symbol:
-                            self.cycle.arm_trade(
-                                positions[0].symbol,
-                                positions[0].entry_price,
-                                positions[0].size,
-                                leverage=self._leverage_for(positions[0].symbol),
-                            )
-                            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
-                            await self._log(
-                                f"[SYNC] Armed TP/SL for open {positions[0].symbol} "
-                                f"entry={positions[0].entry_price}"
-                            )
+                    async with self._state_lock:
+                        if self._mode == "futures_cycle":
+                            self._dry_pos = positions[0]
+                            self._pending_settle = False
+                            self._flat_confirm_count = 0
+                            if (
+                                self.cycle._tp_price <= 0
+                                or self.cycle._plan_pair != positions[0].symbol
+                            ):
+                                self.cycle.arm_trade(
+                                    positions[0].symbol,
+                                    positions[0].entry_price,
+                                    positions[0].size,
+                                    leverage=self._leverage_for(positions[0].symbol),
+                                )
+                                await self.store.save_trade_plan(
+                                    self.cycle.trade_plan_dict()
+                                )
+                                await self._log(
+                                    f"[SYNC] Armed TP/SL for open {positions[0].symbol} "
+                                    f"entry={positions[0].entry_price}"
+                                )
+                            # If we previously unlocked margin but exchange still holds,
+                            # re-debit free so capital cannot be double-spent.
+                            if self._margin_locked <= 0 and positions[0].size > 0:
+                                relock = float(self.cycle._margin_used or 0)
+                                if relock <= 0:
+                                    lev = max(1, self._leverage_for(positions[0].symbol))
+                                    relock = (
+                                        positions[0].size
+                                        * max(positions[0].entry_price, 0)
+                                        * float(self.cycle.usdt_inr)
+                                    ) / lev
+                                if relock > 0:
+                                    self._margin_locked = relock
+                                    await self._ledger_adjust_locked(
+                                        -relock,
+                                        f"RESYNC re-lock {positions[0].symbol}",
+                                    )
+                        self.portfolio.update_positions(positions)
                 else:
-                    if self._mode == "futures_cycle" and not self._dry_pos:
-                        self.cycle.clear_trade()
-                        await self.store.save_trade_plan({})
-                self.portfolio.update_positions(positions)
+                    async with self._state_lock:
+                        if self._mode == "futures_cycle" and flat_local and not self._dry_pos:
+                            self.cycle.clear_trade()
+                            await self.store.save_trade_plan({})
+                        self.portfolio.update_positions(positions)
             except Exception as e:
                 print(f"[SYNC] Error: {e}")
             await asyncio.sleep(10)
@@ -2460,10 +2840,13 @@ class RubaihBot:
                                 pass
                     else:
                         # Flat: keep restored plan only if we somehow still have peaks — normally clear
-                        if self.cycle._plan_pair and not self._dry_pos:
-                            self.cycle.clear_trade()
+                        async with self._state_lock:
+                            if self.cycle._plan_pair and not self._dry_pos:
+                                self.cycle.clear_trade()
                         if self._live and not getattr(self, "_capital_live_ok", False):
                             signal = None
+                        elif self._active_risk:
+                            signal = None  # entries blocked while flatten_failed risk open
                         else:
                             mids = {
                                 p: self._pair_mids[p]
@@ -2537,8 +2920,10 @@ class RubaihBot:
         # Never send exchange TP/SL — CoinDCX INR-M 422s. Bot locks TP/SL at fill.
 
         def _is_reject(result) -> bool:
+            if isinstance(result, list):
+                return False  # create success is typically a list of orders
             if not isinstance(result, dict):
-                return False
+                return True
             code = result.get("code")
             return (
                 result.get("status") == "error"
@@ -2546,29 +2931,35 @@ class RubaihBot:
                 or bool(result.get("error"))
             )
 
-        def _fill_price(result, fallback: float) -> float:
-            """Prefer exchange avg fill over book mid when create response includes it."""
-            if not isinstance(result, dict):
-                return fallback
-            candidates = [result]
-            for key in ("order", "data", "result"):
-                nested = result.get(key)
-                if isinstance(nested, dict):
-                    candidates.append(nested)
-                elif isinstance(nested, list) and nested and isinstance(nested[0], dict):
-                    candidates.append(nested[0])
-            orders = result.get("orders")
-            if isinstance(orders, list) and orders and isinstance(orders[0], dict):
-                candidates.append(orders[0])
-            for obj in candidates:
-                for key in ("avg_price", "average_price", "price", "avgPrice"):
-                    try:
-                        px = float(obj.get(key) or 0)
-                    except (TypeError, ValueError):
-                        px = 0.0
-                    if px > 0:
-                        return px
-            return fallback
+        async def _claim_coid(coid: str) -> bool:
+            """Redis NX claim so the same client_order_id is never double-submitted."""
+            if not self.store.rd or not coid:
+                return True
+            try:
+                ok = await self.store.rd.set(
+                    f"rubaih:coid:{coid}", "pending", nx=True, ex=3600
+                )
+                return bool(ok)
+            except Exception:
+                return True
+
+        async def _finish_coid(coid: str, meta: Dict):
+            if not self.store.rd or not coid:
+                return
+            try:
+                await self.store.rd.set(
+                    f"rubaih:coid:{coid}", json.dumps(meta), ex=86400
+                )
+            except Exception:
+                pass
+
+        def _maybe_update_fx(fx: float):
+            if fx > 0 and abs(fx - float(self.cycle.usdt_inr)) / max(fx, 1e-9) > 0.002:
+                print(
+                    f"[FX] usdt_inr {self.cycle.usdt_inr:.2f} → {fx:.2f} "
+                    f"(exchange settlement_currency_conversion_price)"
+                )
+                self.cycle.usdt_inr = float(fx)
 
         async def _place(qty: float) -> bool:
             if qty <= 0 or qty < perp_prod.min_quantity:
@@ -2590,17 +2981,47 @@ class RubaihBot:
                     f"(no exchange TP/SL fields)"
                 )
                 await self.store.save_hedge(signal, spot, size=qty)
-                self._apply_dry_fill(perp_symbol, side, qty, spot)
+                async with self._state_lock:
+                    await self._apply_fill_locked(
+                        perp_symbol, side, qty, spot, pending_settle=False
+                    )
                 return True
 
-            result = await self.client.place_order(
-                perp_prod.pair, side, qty, "market", lev,
+            coid = f"rb-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+            if not await _claim_coid(coid):
+                await self._log(f"[HEDGE] Idempotency claim failed for {coid} — skip")
+                return False
+
+            try:
+                result = await self.client.place_order(
+                    perp_prod.pair,
+                    side,
+                    qty,
+                    "market",
+                    lev,
+                    client_order_id=coid,
+                )
+            except Exception as e:
+                await self._log(
+                    f"[HEDGE] place_order exception ({coid}): {e} — "
+                    f"reconciling via order list / positions (no blind retry)"
+                )
+                await _finish_coid(coid, {"status": "ambiguous", "error": str(e)})
+                async with self._state_lock:
+                    self._pending_settle = True
+                    self._last_fill_ts = time.time()
+                return False
+
+            await self._log(
+                f"[HEDGE] LIVE create @{lev}x coid={coid}: {result}"
             )
-            await self._log(f"[HEDGE] LIVE order @{lev}x (no exchange TP/SL): {result}")
 
             if _is_reject(result):
                 await self._log(f"[HEDGE] Order rejected — not updating position: {result}")
-                msg = str(result.get("message") or result.get("error") or "").lower()
+                await _finish_coid(coid, {"status": "rejected", "raw": result})
+                msg = ""
+                if isinstance(result, dict):
+                    msg = str(result.get("message") or result.get("error") or "").lower()
                 if "insufficient" in msg:
                     try:
                         m = (qty * spot * self.cycle.usdt_inr) / max(lev, 1)
@@ -2608,13 +3029,70 @@ class RubaihBot:
                         m = self.cycle.trade_margin_budget()
                     await self.note_insufficient_funds(m)
                 return False
-            fill_px = _fill_price(result, spot)
-            if abs(fill_px - spot) / max(spot, 1e-9) > 0.0005:
+
+            initial = CoinDCXClient.normalize_order_payload(result)
+            order_id = str(initial.get("id") or "")
+            # Create often returns status=initial, avg_price=0 — must poll for truth
+            resolved = await self.client.resolve_order_fill(
+                order_id=order_id,
+                requested_qty=qty,
+                timeout_sec=12.0,
+                poll_sec=0.4,
+                initial=initial if initial else None,
+            )
+            filled_qty = float(resolved.get("filled_qty") or 0)
+            fill_px = float(resolved.get("avg_price") or 0)
+            if fill_px <= 0:
+                fill_px = spot
+            fx = float(resolved.get("fx") or 0)
+            _maybe_update_fx(fx)
+            # Prefer conversion price already on create payload
+            if fx <= 0 and initial:
+                try:
+                    _maybe_update_fx(
+                        float(initial.get("settlement_currency_conversion_price") or 0)
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            filled_qty = self._round_qty(filled_qty, perp_prod) if filled_qty > 0 else 0.0
+            await _finish_coid(
+                coid,
+                {
+                    "status": resolved.get("status"),
+                    "order_id": order_id,
+                    "filled_qty": filled_qty,
+                    "avg_price": fill_px,
+                    "requested": qty,
+                },
+            )
+
+            if filled_qty <= 0:
                 await self._log(
-                    f"[HEDGE] Fill price {fill_px:.4f} (mid was {spot:.4f}) — arming TP/SL on fill"
+                    f"[HEDGE] No confirmed fill for {coid} order={order_id} "
+                    f"status={resolved.get('status')} — local SoT unchanged"
                 )
-            await self.store.save_hedge(signal, fill_px, size=qty)
-            self._apply_dry_fill(perp_symbol, side, qty, fill_px)
+                async with self._state_lock:
+                    self._pending_settle = True
+                    self._last_fill_ts = time.time()
+                return False
+
+            if filled_qty + 1e-12 < qty:
+                await self._log(
+                    f"[HEDGE] PARTIAL fill {filled_qty}/{qty} {perp_symbol} "
+                    f"@ {fill_px:.4f} status={resolved.get('status')}"
+                )
+            elif abs(fill_px - spot) / max(spot, 1e-9) > 0.0005:
+                await self._log(
+                    f"[HEDGE] Fill price {fill_px:.4f} (mid was {spot:.4f}) — "
+                    f"arming TP/SL on confirmed fill"
+                )
+
+            await self.store.save_hedge(signal, fill_px, size=filled_qty)
+            async with self._state_lock:
+                await self._apply_fill_locked(
+                    perp_symbol, side, filled_qty, fill_px, pending_settle=True
+                )
             return True
 
         if size > cfg["max_order_size_btc"]:
@@ -2632,8 +3110,15 @@ class RubaihBot:
         qty = self._round_qty(size, perp_prod)
         return await _place(qty)
 
-    def _apply_dry_fill(self, symbol: str, side: Side, qty: float, price: float):
-        """Update local cycle position (dry-run and live) so dashboard reflects fills."""
+    async def _apply_fill_locked(
+        self,
+        symbol: str,
+        side: Side,
+        qty: float,
+        price: float,
+        pending_settle: bool = False,
+    ):
+        """Update local cycle position + ledger. Caller MUST hold self._state_lock."""
         if self._mode != "futures_cycle" or qty <= 0:
             return
         if symbol not in self.products:
@@ -2646,6 +3131,8 @@ class RubaihBot:
             self._pair_mids[symbol] = price
 
         self._last_fill_ts = time.time()
+        self._pending_settle = bool(pending_settle)
+        self._flat_confirm_count = 0
         lev = max(1, self._leverage_for(symbol))
         notional = qty * price * float(self.cycle.usdt_inr)
         fee = notional * float(self.cycle.taker_fee)
@@ -2662,11 +3149,12 @@ class RubaihBot:
                 )
             if self._dry_pos:
                 prev_locked = float(self._margin_locked or 0)
-                self.cycle.arm_trade(symbol, self._dry_pos.entry_price, self._dry_pos.size, leverage=lev)
+                self.cycle.arm_trade(
+                    symbol, self._dry_pos.entry_price, self._dry_pos.size, leverage=lev
+                )
                 new_locked = float(self.cycle._margin_used or 0)
                 self._margin_locked = new_locked
-                # Free capital drops by incremental margin + fee
-                self._ledger_adjust_sync(
+                await self._ledger_adjust_locked(
                     -(max(0.0, new_locked - prev_locked) + fee),
                     f"ENTRY {symbol} margin→₹{new_locked:.0f}",
                 )
@@ -2682,8 +3170,14 @@ class RubaihBot:
                     self.cycle.clear_trade()
                     self._last_flatten_ts = time.time()
                     self._margin_locked = 0.0
-                    # Margin returns + realized PnL − exit fee
-                    self._ledger_adjust_sync(
+                    # Live exits stay pending_settle until exchange confirms flat;
+                    # capital credit already applied here — ghost-close must not double-credit.
+                    if pending_settle:
+                        self._pending_settle = True
+                    else:
+                        self._pending_settle = False
+                        self._active_risk = False
+                    await self._ledger_adjust_locked(
                         release + pnl - fee,
                         f"EXIT {symbol} pnl=₹{pnl:.0f} released=₹{release:.0f}",
                     )
@@ -2692,7 +3186,7 @@ class RubaihBot:
                     release = float(self._margin_locked or 0) * frac
                     self._margin_locked = max(0.0, float(self._margin_locked or 0) - release)
                     pos.size = remain
-                    self._ledger_adjust_sync(
+                    await self._ledger_adjust_locked(
                         release + pnl - fee,
                         f"PARTIAL_EXIT {symbol} pnl=₹{pnl:.0f}",
                     )
@@ -2701,6 +3195,7 @@ class RubaihBot:
                 self.cycle.clear_trade()
                 self._last_flatten_ts = time.time()
                 self._margin_locked = 0.0
+                self._pending_settle = bool(pending_settle)
         if self._dry_pos:
             self.portfolio.update_positions([self._dry_pos])
         else:
@@ -2708,6 +3203,7 @@ class RubaihBot:
             self.cycle.clear_trade()
 
     async def _emergency_unwind(self):
+        """Flatten open risk. Local SoT cleared only after exchange confirms flat."""
         print("[EMERGENCY] Flattening...")
         try:
             if self._live and self.client:
@@ -2716,15 +3212,29 @@ class RubaihBot:
                 print("[DRY-RUN] Would cancel all open orders")
         except Exception as e:
             print(f"[EMERGENCY] cancel_all failed: {e}")
-        pos, pos_pair = self._find_open_position()
-        if pos and pos_pair and pos.size > 0:
-            flatten = -pos.size if (pos.side or "buy").lower() == "buy" else pos.size
+
+        async with self._state_lock:
+            pos, pos_pair = self._find_open_position()
+            snap = None
+            if pos and pos_pair and pos.size > 0:
+                snap = Position(
+                    symbol=pos.symbol,
+                    product_id=pos.product_id,
+                    side=pos.side,
+                    size=pos.size,
+                    entry_price=pos.entry_price,
+                    unrealized_pnl=float(pos.unrealized_pnl or 0),
+                )
+
+        order_ok = False
+        if snap and pos_pair:
+            flatten = -snap.size if (snap.side or "buy").lower() == "buy" else snap.size
             signal = HedgeSignal(
-                time.time(), 0.0, pos.size, flatten,
+                time.time(), 0.0, snap.size, flatten,
                 "emergency", "EMERGENCY_UNWIND", False,
                 pair=pos_pair,
             )
-            await self._execute_hedge(signal, force=True)
+            order_ok = bool(await self._execute_hedge(signal, force=True))
         else:
             greeks = self.portfolio.compute_greeks()
             if abs(greeks.delta) > 0.001:
@@ -2733,11 +3243,87 @@ class RubaihBot:
                     "emergency", "EMERGENCY_UNWIND", False,
                     pair=self._active_pair,
                 )
-                await self._execute_hedge(signal, force=True)
-        self._dry_pos = None
-        self._last_flatten_ts = time.time()
-        self._running = False
-        await self.store.set_engine_status("stopped")
+                order_ok = bool(await self._execute_hedge(signal, force=True))
+                pos_pair = self._active_pair
+            else:
+                # Already flat locally
+                async with self._state_lock:
+                    self._dry_pos = None
+                    self._pending_settle = False
+                    self._active_risk = False
+                    self._last_flatten_ts = time.time()
+                self._running = False
+                await self.store.set_engine_status("stopped")
+                return
+
+        if not self._live:
+            async with self._state_lock:
+                self._dry_pos = None
+                self.cycle.clear_trade()
+                self._margin_locked = 0.0
+                self._pending_settle = False
+                self._active_risk = False
+                self._last_flatten_ts = time.time()
+                self.portfolio.update_positions([])
+            self._running = False
+            await self.store.set_engine_status("stopped")
+            return
+
+        # LIVE: only clear SoT after consecutive flat confirms on exchange
+        flat = False
+        if order_ok and pos_pair:
+            flat = await self._confirm_exchange_flat(pos_pair, reads=3, delay_sec=1.2)
+        elif not order_ok:
+            print("[EMERGENCY] Flatten order rejected/failed — not clearing local SoT")
+
+        async with self._state_lock:
+            if flat:
+                self._dry_pos = None
+                self.cycle.clear_trade()
+                self._margin_locked = 0.0
+                self._pending_settle = False
+                self._active_risk = False
+                self._flat_confirm_count = 0
+                self._last_flatten_ts = time.time()
+                self.portfolio.update_positions([])
+                print("[EMERGENCY] Exchange flat confirmed — local SoT cleared")
+                stop = True
+                status = "stopped"
+            else:
+                # Restore / keep position as ACTIVE RISK — never orphan exchange exposure
+                if snap and (not self._dry_pos or self._dry_pos.size <= 0):
+                    self._dry_pos = snap
+                    self.cycle.arm_trade(
+                        snap.symbol,
+                        snap.entry_price,
+                        snap.size,
+                        leverage=self._leverage_for(snap.symbol),
+                    )
+                    self.portfolio.update_positions([self._dry_pos])
+                self._pending_settle = False
+                self._active_risk = True
+                self._flat_confirm_count = 0
+                print(
+                    "[EMERGENCY] Flatten NOT confirmed — position flagged ACTIVE RISK; "
+                    "engine stays up for sync overlay (no silent orphan)"
+                )
+                stop = False
+                status = "flatten_failed"
+
+        await self.store.set_engine_status(status)
+        if stop:
+            self._running = False
+        else:
+            # Keep process alive so sync_positions continues to track exchange risk
+            self._running = True
+            try:
+                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+            except Exception:
+                pass
+            await self._log(
+                "[EMERGENCY] ACTIVE RISK — manual flatten or retry kill required; "
+                "entries blocked by kill switch"
+            )
 
     async def run(self):
         self._running = True
@@ -2755,6 +3341,9 @@ class RubaihBot:
         )
         print(f"  Free ≈ ₹{self.cycle.free_capital_inr:.0f} (budget ₹{self.cycle.trade_margin_budget():.0f})")
         print(f"  AI: {'ENABLED' if self._ai_enabled else 'DISABLED'}")
+        print(
+            f"  Control bus: {'HMAC ON' if len(CMD_SECRET) >= 16 else 'HMAC OFF (set RUBAIH_API_TOKEN)'}"
+        )
         print("=" * 60 + "\n")
 
         tasks = [

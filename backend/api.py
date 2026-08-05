@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openrouter_ai import ai_configured
+from cmd_bus import sign_command, filter_settings
 
 API_TOKEN = os.getenv("RUBAIH_API_TOKEN", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
@@ -290,10 +291,8 @@ async def risk_events(limit: int = Query(default=20, ge=1, le=100)):
 
 @app.post("/api/kill-switch", dependencies=[Depends(require_token)])
 async def kill_switch():
-    await rd_client.publish(
-        "rubaih:command",
-        json.dumps({"command": "KILL_SWITCH", "source": "mobile_app", "ts": _utc_now()}),
-    )
+    payload = sign_command(API_TOKEN, "KILL_SWITCH", source="mobile_app")
+    await rd_client.publish("rubaih:command", json.dumps(payload))
     await pg_pool.execute(
         "INSERT INTO risk_events (event_type, details) VALUES ($1, $2)",
         "KILL_SWITCH", "Triggered manually from authenticated mobile/API client",
@@ -379,12 +378,13 @@ async def get_settings():
 @app.put("/api/settings", dependencies=[Depends(require_token)])
 async def update_settings(s: SettingsUpdate):
     updates = {k: str(v) for k, v in s.model_dump(exclude_unset=True).items()}
+    updates = {k: v for k, v in filter_settings(updates).items()}
     if updates:
         await rd_client.hset("rubaih:settings", mapping=updates)
-        await rd_client.publish(
-            "rubaih:command",
-            json.dumps({"command": "UPDATE_SETTINGS", "data": updates, "ts": _utc_now()}),
+        payload = sign_command(
+            API_TOKEN, "UPDATE_SETTINGS", data=updates, source="mobile_app"
         )
+        await rd_client.publish("rubaih:command", json.dumps(payload))
     return {"status": "updated", "settings": await get_settings()}
 
 

@@ -20,6 +20,8 @@ trading:
   # Fallback only for dry-run. LIVE uses wallet API or RUBAIH_FREE_CAPITAL_INR.
   capital_inr: 1000
   leverage: 10
+  # Seed / fallback only — LIVE prefers wallet; FX updated from exchange
+  # settlement_currency_conversion_price on each fill when present.
   usdt_inr: 87
 
   # Hard cap risk per trade — engine never bumps min-lot past max_frac×free
