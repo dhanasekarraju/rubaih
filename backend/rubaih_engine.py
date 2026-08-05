@@ -161,6 +161,11 @@ class CoinDCXClient:
         self._auth_ok = False
         # CoinDCX docs disagree: code samples use ms, some tables say seconds
         self._ts_mode = "ms"  # "ms" | "s"
+        # cross_margin_details is optional and 404s on some account types. Six
+        # signed probes every refresh is real rate-limit burn, so give up after
+        # a few whole-sweep failures and re-probe only occasionally.
+        self._cmd_misses = 0
+        self._cmd_retry_after = 0.0
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(headers=_HTTP_HEADERS)
@@ -583,9 +588,20 @@ class CoinDCXClient:
             {"margin_currency_short_name": [self.margin]},
         )
 
+    CMD_MAX_MISSES = 3
+    CMD_RETRY_SEC = 1800
+
     async def get_cross_margin_details(self) -> Dict:
-        """Live free futures margin (available_balance_cross)."""
+        """Live free futures margin (available_balance_cross).
+
+        Optional endpoint: when the account cannot serve it, futures_wallets is
+        the working fallback, so stop paying six signed calls per refresh for an
+        answer that never arrives.
+        """
         if not self._auth_ok:
+            return {}
+        now = time.time()
+        if self._cmd_misses >= self.CMD_MAX_MISSES and now < self._cmd_retry_after:
             return {}
         # Docs disagree POST vs GET — try both; include margin currency for INR-M
         bodies = [
@@ -600,11 +616,32 @@ class CoinDCXClient:
                     "/exchange/v1/derivatives/futures/positions/cross_margin_details",
                     body,
                 )
-                if isinstance(data, dict) and data.get("available_balance_cross") is not None:
+                usable = isinstance(data, dict) and (
+                    data.get("available_balance_cross") is not None
+                    or (
+                        data.get("code") not in (404, "404", 400, "400")
+                        and any(
+                            k in data
+                            for k in (
+                                "available_balance_cross",
+                                "total_wallet_balance",
+                                "withdrawable_balance",
+                            )
+                        )
+                    )
+                )
+                if usable:
+                    self._cmd_misses = 0
+                    self._cmd_retry_after = 0.0
                     return data
-                if isinstance(data, dict) and data.get("code") not in (404, "404", 400, "400"):
-                    if any(k in data for k in ("available_balance_cross", "total_wallet_balance", "withdrawable_balance")):
-                        return data
+        self._cmd_misses += 1
+        if self._cmd_misses == self.CMD_MAX_MISSES:
+            print(
+                "[API] cross_margin_details unsupported on this account — "
+                f"using futures_wallets, re-probing every {self.CMD_RETRY_SEC // 60}m"
+            )
+        if self._cmd_misses >= self.CMD_MAX_MISSES:
+            self._cmd_retry_after = now + self.CMD_RETRY_SEC
         return {}
 
     async def get_futures_wallets(self) -> List[Dict]:
