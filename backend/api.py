@@ -24,9 +24,13 @@ from pydantic import BaseModel, Field
 
 from openrouter_ai import ai_configured
 from cmd_bus import sign_command, filter_settings
+from app_config import load_config, settings_defaults_from_config
 
 API_TOKEN = os.getenv("RUBAIH_API_TOKEN", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
+
+# Authoritative defaults — same config.yaml the engine loads (no hardcoded risk limits).
+CFG = load_config()
 
 pg_pool: Optional[asyncpg.Pool] = None
 rd_client: Optional[redis.Redis] = None
@@ -304,6 +308,21 @@ async def kill_switch():
     }
 
 
+@app.post("/api/kill-switch/reset", dependencies=[Depends(require_token)])
+async def kill_switch_reset():
+    """Clear a persisted kill so the engine may resume without a process restart."""
+    payload = sign_command(API_TOKEN, "RESET_KILL", source="mobile_app")
+    await rd_client.publish("rubaih:command", json.dumps(payload))
+    await pg_pool.execute(
+        "INSERT INTO risk_events (event_type, details) VALUES ($1, $2)",
+        "KILL_RESET", "Cleared via authenticated POST /api/kill-switch/reset",
+    )
+    return {
+        "status": "kill_switch_reset",
+        "message": "Reset signal sent — engine will clear kill and re-baseline HWM",
+    }
+
+
 @app.get("/api/scan", dependencies=[Depends(require_token)])
 async def get_scan():
     raw = await rd_client.get("rubaih:scan")
@@ -331,32 +350,8 @@ async def get_logs(limit: int = Query(default=80, ge=1, le=200)):
 async def get_settings():
     settings = await rd_client.hgetall("rubaih:settings")
     if not settings:
-        settings = {
-            "mode": "futures_cycle",
-            "delta_threshold": "0.0005",
-            "max_delta": "0.002",
-            "max_vega": "100.0",
-            "max_drawdown_pct": "0.10",
-            "capital_inr": "5000",
-            "margin_use_frac": "0.25",
-            "margin_use_max_frac": "0.30",
-            "take_profit_price_pct": "0.014",
-            "take_profit_roe": "0.14",
-            "stop_loss_price_pct": "0.007",
-            "stop_loss_roe": "0.07",
-            "take_profit_pct": "0.014",
-            "stop_loss_pct": "0.007",
-            "tp_display": "Price +1.40% (ROE≈+14% @10x)",
-            "sl_display": "Price −0.70% (ROE≈−7% @10x)",
-            "leverage": "10",
-            "live_trading": str(LIVE_TRADING).lower(),
-            "exchange": "coindcx",
-            "margin_currency": "INR",
-            "perp_symbol": "B-ETH_USDT",
-            "active_pair": "B-ETH_USDT",
-            "scan_enabled": "true",
-            "scan_pairs": "B-ETH_USDT,B-SOL_USDT,B-BNB_USDT,B-BTC_USDT",
-        }
+        # Engine seeds Redis on boot; before that, serve config.yaml only.
+        settings = settings_defaults_from_config(CFG, live_trading=LIVE_TRADING)
     # Keep non-float metadata as strings in response
     string_keys = {
         "mode", "exchange", "margin_currency", "perp_symbol", "active_pair",

@@ -29,11 +29,11 @@ import aiohttp
 import asyncpg
 import redis.asyncio as redis
 import socketio
-import yaml
 from scipy.stats import norm
 
 from openrouter_ai import OpenRouterAI, AIDecision, ai_configured
 from cmd_bus import verify_command, filter_settings
+from app_config import load_config, assert_risk_limits, settings_defaults_from_config
 
 # ==============================================================================
 # CONFIG
@@ -46,8 +46,8 @@ def _env_secret(name: str) -> str:
     return v
 
 
-with open("config.yaml", "r") as f:
-    CFG = yaml.safe_load(f)
+CFG = load_config()
+assert_risk_limits(CFG)
 
 REST_URL = CFG["exchange"]["rest_url"].rstrip("/")
 PUBLIC_URL = CFG["exchange"].get("public_url", "https://public.coindcx.com").rstrip("/")
@@ -1282,6 +1282,8 @@ class RiskManager:
         self.capital_base = float(cfg.get("capital_inr", 1000) or 1000)
         self._hwm = 0.0
         self._kill = False
+        self._kill_reason = ""
+        self._kill_ts = 0.0
         self._order_ts: List[float] = []
 
     def check(
@@ -1292,7 +1294,8 @@ class RiskManager:
     ) -> Optional[str]:
         if self._kill:
             return "KILL_SWITCH_ACTIVE"
-        self._hwm = max(self._hwm, pnl)
+        if pnl > self._hwm:
+            self._hwm = pnl
         dd = self._hwm - pnl
         # Drawdown is a fraction of account capital, not a fraction of a tiny
         # unrealized-PnL high-water mark. The old denominator made a move from
@@ -1300,17 +1303,14 @@ class RiskManager:
         base = max(float(capital_base or self.capital_base or 0), 1.0)
         dd_pct = dd / base
         if dd_pct > self.max_dd:
-            self._kill = True
-            return (
+            return self.trigger_kill(
                 f"MAX_DRAWDOWN: ₹{dd:.0f}/{base:.0f}={dd_pct:.1%} "
                 f"(limit {self.max_dd:.1%})"
             )
         if abs(greeks.delta) > self.max_delta:
-            self._kill = True
-            return f"MAX_DELTA: {greeks.delta:.4f}"
+            return self.trigger_kill(f"MAX_DELTA: {greeks.delta:.4f}")
         if abs(greeks.vega) > self.max_vega:
-            self._kill = True
-            return f"MAX_VEGA: {greeks.vega:.2f}"
+            return self.trigger_kill(f"MAX_VEGA: {greeks.vega:.2f}")
         return None
 
     def rate_limit_ok(self) -> bool:
@@ -1325,9 +1325,43 @@ class RiskManager:
     def alive(self) -> bool:
         return not self._kill
 
-    def trigger_kill(self, reason: str):
+    @property
+    def kill_reason(self) -> str:
+        return self._kill_reason or "kill switch"
+
+    def trigger_kill(self, reason: str) -> str:
         self._kill = True
-        print(f"[RISK] KILL SWITCH: {reason}")
+        self._kill_reason = str(reason or "KILL_SWITCH")
+        self._kill_ts = time.time()
+        print(f"[RISK] KILL SWITCH: {self._kill_reason}")
+        return self._kill_reason
+
+    def clear_kill(self, hwm: Optional[float] = None) -> None:
+        """Operator reset. Optionally re-baseline HWM so we don't instantly re-kill."""
+        self._kill = False
+        self._kill_reason = ""
+        self._kill_ts = 0.0
+        if hwm is not None:
+            self._hwm = float(hwm)
+
+    def to_state(self) -> Dict:
+        return {
+            "kill": bool(self._kill),
+            "hwm": float(self._hwm),
+            "reason": str(self._kill_reason or ""),
+            "ts": float(self._kill_ts or time.time()),
+        }
+
+    def restore(self, state: Dict) -> None:
+        if not state:
+            return
+        self._hwm = max(0.0, float(state.get("hwm") or 0.0))
+        self._kill = bool(state.get("kill"))
+        self._kill_reason = str(state.get("reason") or "")
+        try:
+            self._kill_ts = float(state.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            self._kill_ts = 0.0
 
 # ==============================================================================
 # DATA STORE
@@ -1413,6 +1447,26 @@ class DataStore:
     async def set_engine_status(self, status: str):
         await self.rd.set("rubaih:engine_status", status)
         await self.rd.publish("rubaih:status", json.dumps({"status": status, "ts": time.time()}))
+
+    async def save_risk_state(self, state: Dict):
+        """Persist kill switch + drawdown HWM across restarts."""
+        if not self.rd:
+            return
+        payload = dict(state or {})
+        payload["ts"] = float(payload.get("ts") or time.time())
+        await self.rd.set("rubaih:risk_state", json.dumps(payload))
+
+    async def load_risk_state(self) -> Dict:
+        if not self.rd:
+            return {}
+        raw = await self.rd.get("rubaih:risk_state")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     async def push_log(self, line: str):
         """Append a live log line for the mobile Logs tab."""
@@ -1591,6 +1645,52 @@ class RubaihBot:
         except Exception:
             pass
 
+    async def _persist_risk_state(self):
+        """Write kill + HWM so a restart cannot silently resume after a halt."""
+        try:
+            await self.store.save_risk_state(self.risk.to_state())
+        except Exception as e:
+            await self._log(f"[RISK] persist failed: {e}")
+
+    async def _load_risk_state(self):
+        """Restore kill/HWM before trading loops start."""
+        try:
+            state = await self.store.load_risk_state()
+        except Exception as e:
+            await self._log(f"[RISK] load failed: {e}")
+            return
+        if not state:
+            return
+        self.risk.restore(state)
+        await self._log(
+            f"[RISK] restored hwm=₹{self.risk._hwm:.2f} "
+            f"kill={self.risk._kill} reason={self.risk.kill_reason or 'n/a'}"
+        )
+        if self.risk._kill:
+            await self.store.set_engine_status("kill_switch")
+            await self._log(
+                f"[HALT] Restored kill switch — entries blocked until "
+                f"POST /api/kill-switch/reset. Reason: {self.risk.kill_reason}"
+            )
+
+    async def _clear_kill_switch(self, note: str = "operator reset", rebase_hwm: bool = True):
+        """Authenticated clear of a persisted kill. Re-baselines HWM by default."""
+        session_pnl = 0.0
+        if rebase_hwm:
+            session_pnl = sum(
+                p.unrealized_pnl for p in self.portfolio.positions.values()
+            )
+            if self._dry_pos:
+                session_pnl = self._dry_pos.unrealized_pnl
+        self.risk.clear_kill(hwm=session_pnl if rebase_hwm else None)
+        await self._persist_risk_state()
+        await self.store.set_engine_status("running" if self._live else "dry_run")
+        await self.store.save_risk_event("KILL_RESET", note)
+        await self._log(
+            f"[HALT] Cleared ({note}) — trading allowed again "
+            f"hwm=₹{self.risk._hwm:.2f}"
+        )
+
     def _scan_rows(self) -> List[Dict]:
         rows = []
         for pair in self._scan_pairs:
@@ -1641,41 +1741,20 @@ class RubaihBot:
     async def _seed_settings(self):
         cfg = CFG["trading"]
         scfg = cfg.get("strategy") or {}
-        defaults = {
-            "mode": self._mode,
-            "delta_threshold": str(cfg["delta_threshold"]),
-            "max_delta": str(cfg["max_delta"]),
-            "max_vega": str(cfg["max_vega"]),
-            "max_drawdown_pct": str(cfg["max_drawdown_pct"]),
-            "capital_inr": str(cfg.get("capital_inr", 5000)),
-            "margin_use_frac": str(cfg.get("margin_use_frac", 0.25)),
-            "margin_use_max_frac": str(cfg.get("margin_use_max_frac", 0.30)),
-            "take_profit_price_pct": str(
-                scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.014))
-            ),
-            "stop_loss_price_pct": str(
-                scfg.get("stop_loss_price_pct", scfg.get("stop_loss_pct", 0.007))
-            ),
-            "take_profit_pct": str(scfg.get("take_profit_pct", 0.014)),
-            "stop_loss_pct": str(scfg.get("stop_loss_pct", 0.007)),
-            "max_loss_frac": str(scfg.get("max_loss_frac", 0.08)),
-            "trail_arm_r": str(scfg.get("trail_arm_r", 0.35)),
-            "trail_giveback_r": str(scfg.get("trail_giveback_r", 0.30)),
-            "leverage": str(cfg.get("leverage", 10)),
-            "live_trading": str(self._live).lower(),
-            "exchange": "coindcx",
-            "margin_currency": MARGIN_CCY,
-            "perp_symbol": cfg["perp_symbol"],
-            "active_pair": self._active_pair,
-            "scan_enabled": str(self._scan_enabled).lower(),
-            "scan_pairs": ",".join(self._scan_pairs),
-        }
+        defaults = settings_defaults_from_config(CFG, live_trading=self._live)
+        # Engine-owned fields that can diverge from yaml after scan bootstrap
+        defaults["mode"] = self._mode
+        defaults["margin_currency"] = MARGIN_CCY
+        defaults["perp_symbol"] = cfg["perp_symbol"]
+        defaults["active_pair"] = self._active_pair
+        defaults["scan_enabled"] = str(self._scan_enabled).lower()
+        defaults["scan_pairs"] = ",".join(self._scan_pairs)
         force_keys = (
             "mode", "capital_inr", "margin_use_frac", "margin_use_max_frac", "leverage",
             "take_profit_price_pct", "stop_loss_price_pct",
             "take_profit_pct", "stop_loss_pct",
             "perp_symbol", "margin_currency", "live_trading", "max_delta",
-            "max_drawdown_pct",
+            "max_vega", "max_drawdown_pct",
         )
         existing = await self.store.rd.hgetall("rubaih:settings")
         merged = dict(existing or {})
@@ -1719,6 +1798,8 @@ class RubaihBot:
                 self._mode = str(defaults["mode"]).strip().lower()
             elif k == "max_delta":
                 self.risk.max_delta = float(defaults["max_delta"])
+            elif k == "max_vega":
+                self.risk.max_vega = float(defaults["max_vega"])
             elif k == "max_drawdown_pct":
                 self.risk.max_dd = float(defaults["max_drawdown_pct"])
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
@@ -2143,10 +2224,19 @@ class RubaihBot:
                         reason = f"API_KILL_SWITCH from {payload.get('source', 'unknown')}"
                         print(f"[CMD] {reason}")
                         self.risk.trigger_kill(reason)
+                        await self._persist_risk_state()
                         await self.store.save_risk_event("KILL_SWITCH", reason)
                         await self.store.set_engine_status("kill_switch")
                         await self._emergency_unwind()
-                        return
+                        # Stay alive so RESET_KILL can clear without process restart
+                        continue
+                    if cmd in ("RESET_KILL", "CLEAR_KILL", "RESUME"):
+                        note = (
+                            f"{cmd} from {payload.get('source', 'unknown')}"
+                        )
+                        print(f"[CMD] {note}")
+                        await self._clear_kill_switch(note=note, rebase_hwm=True)
+                        continue
                     if cmd == "UPDATE_SETTINGS":
                         data = filter_settings(payload.get("data") or {})
                         if not data:
@@ -2301,7 +2391,10 @@ class RubaihBot:
             mapping={"scan_pairs": ",".join(self._scan_pairs), "active_pair": self._active_pair},
         )
         await self._refresh_free_capital(force=True)
-        await self.store.set_engine_status("running" if self._live else "dry_run")
+        await self._load_risk_state()
+        if self.risk.alive:
+            await self.store.set_engine_status("running" if self._live else "dry_run")
+        # else status already set to kill_switch by _load_risk_state
         # Restore open-trade TP/SL plan after restart
         plan = await self.store.load_trade_plan()
         if plan:
@@ -2812,17 +2905,28 @@ class RubaihBot:
 
                     if decision.action == "EMERGENCY" and decision.confidence > 0.95:
                         self.risk.trigger_kill(f"AI_EMERGENCY: {decision.reasoning}")
+                        await self._persist_risk_state()
                         await self.store.save_risk_event("AI_EMERGENCY", decision.reasoning)
                         await self.store.set_engine_status("kill_switch")
                         await self._emergency_unwind()
-                        break
+                        # Stay in loop; main_loop will idle until RESET_KILL
+                        continue
             except Exception as e:
                 print(f"[AI LOOP] Error: {e}")
             await asyncio.sleep(180)  # 3 min — free tiers rate-limit hard
 
     async def main_loop(self):
-        while self._running and self.risk.alive:
+        while self._running:
             try:
+                if not self.risk.alive:
+                    if int(time.time()) % 60 < 2:
+                        await self._log(
+                            f"[HALT] kill active — {self.risk.kill_reason} "
+                            f"(POST /api/kill-switch/reset to clear)"
+                        )
+                    await asyncio.sleep(2)
+                    continue
+
                 spot = self._mid_for(self._active_pair)
                 if spot <= 0 and not self._pair_mids:
                     await asyncio.sleep(1)
@@ -2846,13 +2950,17 @@ class RubaihBot:
                     float(self.cycle.capital_inr or 0),
                     1.0,
                 )
+                prev_hwm = self.risk._hwm
                 violation = self.risk.check(greeks, session_pnl, capital_base)
+                # Persist HWM rises and any kill flip so restarts stay continuous
+                if violation or self.risk._hwm != prev_hwm:
+                    await self._persist_risk_state()
                 if violation:
                     await self._log(f"[RISK] VIOLATION: {violation}")
                     await self.store.save_risk_event("VIOLATION", violation)
-                    await self.store.set_engine_status("halted")
+                    await self.store.set_engine_status("kill_switch")
                     await self._emergency_unwind()
-                    break
+                    continue
 
                 if self._mode == "futures_cycle":
                     await self._refresh_free_capital()
