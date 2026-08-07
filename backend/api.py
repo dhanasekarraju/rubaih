@@ -8,9 +8,10 @@ import os
 import json
 import asyncio
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -157,6 +158,28 @@ class SettingsUpdate(BaseModel):
     max_delta: Optional[float] = Field(default=None, gt=0)
     max_vega: Optional[float] = Field(default=None, gt=0)
     max_drawdown_pct: Optional[float] = Field(default=None, gt=0, le=1)
+    max_notional_inr: Optional[float] = Field(default=None, gt=0)
+    max_day_loss_inr: Optional[float] = Field(default=None, gt=0)
+
+
+async def _merge_risk_state(**fields: Any) -> Dict[str, Any]:
+    """Dual-write kill durability even if the engine is down / misses pubsub."""
+    state: Dict[str, Any] = {}
+    try:
+        raw = await rd_client.get("rubaih:risk_state")
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                state = parsed
+    except Exception:
+        state = {}
+    state.update({k: v for k, v in fields.items() if v is not None})
+    if "hwm" not in state:
+        state["hwm"] = 0.0
+    if "ts" not in fields:
+        state["ts"] = time.time()
+    await rd_client.set("rubaih:risk_state", json.dumps(state))
+    return state
 
 
 @app.get("/api/health")
@@ -295,6 +318,9 @@ async def risk_events(limit: int = Query(default=20, ge=1, le=100)):
 
 @app.post("/api/kill-switch", dependencies=[Depends(require_token)])
 async def kill_switch():
+    reason = "API_KILL_SWITCH from mobile_app"
+    # Persist BEFORE publish so a down/restarting engine cannot miss the halt
+    await _merge_risk_state(kill=True, reason=reason, ts=time.time())
     payload = sign_command(API_TOKEN, "KILL_SWITCH", source="mobile_app")
     await rd_client.publish("rubaih:command", json.dumps(payload))
     await pg_pool.execute(
@@ -311,6 +337,8 @@ async def kill_switch():
 @app.post("/api/kill-switch/reset", dependencies=[Depends(require_token)])
 async def kill_switch_reset():
     """Clear a persisted kill so the engine may resume without a process restart."""
+    # Clear durable flag even if engine is offline (HWM / day totals preserved)
+    await _merge_risk_state(kill=False, reason="", ts=time.time())
     payload = sign_command(API_TOKEN, "RESET_KILL", source="mobile_app")
     await rd_client.publish("rubaih:command", json.dumps(payload))
     await pg_pool.execute(

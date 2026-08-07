@@ -41,7 +41,13 @@ def assert_risk_limits(cfg: Dict[str, Any] | None = None) -> None:
     """Fail loudly if authoritative risk limits are missing or non-positive."""
     data = cfg if cfg is not None else load_config()
     trading = data.get("trading") or {}
-    required = ("max_delta", "max_vega", "max_drawdown_pct")
+    required = (
+        "max_delta",
+        "max_vega",
+        "max_drawdown_pct",
+        "max_notional_inr",
+        "max_day_loss_inr",
+    )
     missing = [k for k in required if k not in trading or trading[k] is None]
     if missing:
         raise RuntimeError(
@@ -86,6 +92,8 @@ def settings_defaults_from_config(
         "max_delta": str(trading["max_delta"]),
         "max_vega": str(trading["max_vega"]),
         "max_drawdown_pct": str(trading["max_drawdown_pct"]),
+        "max_notional_inr": str(trading["max_notional_inr"]),
+        "max_day_loss_inr": str(trading["max_day_loss_inr"]),
         "capital_inr": str(trading.get("capital_inr", 1000)),
         "margin_use_frac": str(trading.get("margin_use_frac", 0.25)),
         "margin_use_max_frac": str(trading.get("margin_use_max_frac", 0.30)),

@@ -73,6 +73,8 @@ ALLOWED_SETTINGS_KEYS = frozenset(
         "max_drawdown_pct",
         "max_delta",
         "max_vega",
+        "max_notional_inr",
+        "max_day_loss_inr",
         "delta_threshold",
         "margin_use_frac",
         "margin_use_max_frac",

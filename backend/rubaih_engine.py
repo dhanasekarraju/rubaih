@@ -959,6 +959,19 @@ class FuturesCycleStrategist:
                     return 0.0
             else:
                 qty = floored
+
+        # Hard notional cap (₹) — futures-real limit from config.yaml
+        max_notion = float(CFG["trading"].get("max_notional_inr") or 0)
+        if max_notion > 0 and qty > 0 and spot > 0 and self.usdt_inr > 0:
+            max_qty = max_notion / (spot * self.usdt_inr)
+            if qty > max_qty:
+                qty = max_qty
+                if st > 0:
+                    decimals = max(0, min(8, int(round(-math.log10(st))) if st < 1 else 0))
+                    qty = math.floor(qty / st + 1e-12) * st
+                    qty = round(qty, decimals)
+                if min_q > 0 and qty + 1e-12 < min_q:
+                    return 0.0
         return float(qty)
 
     def margin_for(self, spot: float, qty: float, leverage: Optional[float] = None) -> float:
@@ -1276,24 +1289,46 @@ class FuturesCycleStrategist:
 class RiskManager:
     def __init__(self):
         cfg = CFG["trading"]
-        self.max_delta = cfg["max_delta"]
-        self.max_vega = cfg["max_vega"]
-        self.max_dd = cfg["max_drawdown_pct"]
+        self.max_delta = float(cfg["max_delta"])
+        self.max_vega = float(cfg["max_vega"])
+        self.max_dd = float(cfg["max_drawdown_pct"])
+        self.max_notional_inr = float(cfg["max_notional_inr"])
+        self.max_day_loss_inr = float(cfg["max_day_loss_inr"])
         self.capital_base = float(cfg.get("capital_inr", 1000) or 1000)
         self._hwm = 0.0
         self._kill = False
         self._kill_reason = ""
         self._kill_ts = 0.0
+        self._day_key = time.strftime("%Y-%m-%d", time.gmtime())
+        self._day_realized = 0.0
         self._order_ts: List[float] = []
+
+    def _roll_day(self) -> None:
+        key = time.strftime("%Y-%m-%d", time.gmtime())
+        if key != self._day_key:
+            self._day_key = key
+            self._day_realized = 0.0
+
+    def note_realized(self, pnl_inr: float) -> None:
+        """Accumulate closed-trade PnL for the UTC calendar day."""
+        self._roll_day()
+        self._day_realized += float(pnl_inr or 0.0)
+
+    def day_pnl(self, unrealized: float = 0.0) -> float:
+        self._roll_day()
+        return float(self._day_realized) + float(unrealized or 0.0)
 
     def check(
         self,
         greeks: GreeksSnapshot,
         pnl: float,
         capital_base: Optional[float] = None,
+        *,
+        notional_inr: float = 0.0,
     ) -> Optional[str]:
         if self._kill:
             return "KILL_SWITCH_ACTIVE"
+        self._roll_day()
         if pnl > self._hwm:
             self._hwm = pnl
         dd = self._hwm - pnl
@@ -1306,6 +1341,18 @@ class RiskManager:
             return self.trigger_kill(
                 f"MAX_DRAWDOWN: ₹{dd:.0f}/{base:.0f}={dd_pct:.1%} "
                 f"(limit {self.max_dd:.1%})"
+            )
+        notion = abs(float(notional_inr or 0.0))
+        if notion > self.max_notional_inr:
+            return self.trigger_kill(
+                f"MAX_NOTIONAL: ₹{notion:.0f} > limit ₹{self.max_notional_inr:.0f}"
+            )
+        day = self.day_pnl(pnl)
+        if day < -self.max_day_loss_inr:
+            return self.trigger_kill(
+                f"MAX_DAY_LOSS: day=₹{day:.0f} "
+                f"(realized=₹{self._day_realized:.0f} uPnL=₹{pnl:.0f}) "
+                f"limit -₹{self.max_day_loss_inr:.0f}"
             )
         if abs(greeks.delta) > self.max_delta:
             return self.trigger_kill(f"MAX_DELTA: {greeks.delta:.4f}")
@@ -1345,11 +1392,14 @@ class RiskManager:
             self._hwm = float(hwm)
 
     def to_state(self) -> Dict:
+        self._roll_day()
         return {
             "kill": bool(self._kill),
             "hwm": float(self._hwm),
             "reason": str(self._kill_reason or ""),
             "ts": float(self._kill_ts or time.time()),
+            "day_key": str(self._day_key),
+            "day_realized": float(self._day_realized),
         }
 
     def restore(self, state: Dict) -> None:
@@ -1362,6 +1412,12 @@ class RiskManager:
             self._kill_ts = float(state.get("ts") or 0.0)
         except (TypeError, ValueError):
             self._kill_ts = 0.0
+        self._day_key = str(state.get("day_key") or time.strftime("%Y-%m-%d", time.gmtime()))
+        try:
+            self._day_realized = float(state.get("day_realized") or 0.0)
+        except (TypeError, ValueError):
+            self._day_realized = 0.0
+        self._roll_day()  # zero if persisted day is stale
 
 # ==============================================================================
 # DATA STORE
@@ -1664,6 +1720,7 @@ class RubaihBot:
         self.risk.restore(state)
         await self._log(
             f"[RISK] restored hwm=₹{self.risk._hwm:.2f} "
+            f"day=₹{self.risk._day_realized:.2f}({self.risk._day_key}) "
             f"kill={self.risk._kill} reason={self.risk.kill_reason or 'n/a'}"
         )
         if self.risk._kill:
@@ -1754,7 +1811,7 @@ class RubaihBot:
             "take_profit_price_pct", "stop_loss_price_pct",
             "take_profit_pct", "stop_loss_pct",
             "perp_symbol", "margin_currency", "live_trading", "max_delta",
-            "max_vega", "max_drawdown_pct",
+            "max_vega", "max_drawdown_pct", "max_notional_inr", "max_day_loss_inr",
         )
         existing = await self.store.rd.hgetall("rubaih:settings")
         merged = dict(existing or {})
@@ -1802,6 +1859,10 @@ class RubaihBot:
                 self.risk.max_vega = float(defaults["max_vega"])
             elif k == "max_drawdown_pct":
                 self.risk.max_dd = float(defaults["max_drawdown_pct"])
+            elif k == "max_notional_inr":
+                self.risk.max_notional_inr = float(defaults["max_notional_inr"])
+            elif k == "max_day_loss_inr":
+                self.risk.max_day_loss_inr = float(defaults["max_day_loss_inr"])
         self.cycle.usdt_inr = float(cfg.get("usdt_inr", 87))
         self.cycle.take_profit_price_pct = float(
             scfg.get("take_profit_price_pct", scfg.get("take_profit_pct", 0.014))
@@ -1880,6 +1941,10 @@ class RubaihBot:
             self.risk.max_vega = float(data["max_vega"])
         if "max_drawdown_pct" in data:
             self.risk.max_dd = float(data["max_drawdown_pct"])
+        if "max_notional_inr" in data:
+            self.risk.max_notional_inr = float(data["max_notional_inr"])
+        if "max_day_loss_inr" in data:
+            self.risk.max_day_loss_inr = float(data["max_day_loss_inr"])
         # capital_inr intentionally NOT applied from command bus — prevents free-capital poison
         if "margin_use_frac" in data:
             self.cycle.margin_use_frac = float(data["margin_use_frac"])
@@ -1923,7 +1988,9 @@ class RubaihBot:
         print(
             f"[SETTINGS] mode={self._mode} threshold={self.strategist.delta_threshold} "
             f"max_delta={self.risk.max_delta} max_vega={self.risk.max_vega} "
-            f"max_dd={self.risk.max_dd} capital≈₹{self.cycle.capital_inr} "
+            f"max_dd={self.risk.max_dd} max_notion=₹{self.risk.max_notional_inr:.0f} "
+            f"max_day_loss=₹{self.risk.max_day_loss_inr:.0f} "
+            f"capital≈₹{self.cycle.capital_inr} "
             f"use={self.cycle.margin_use_frac:.0%}–{self.cycle.margin_use_max_frac:.0%} "
             f"lev={self._leverage}x"
         )
@@ -2769,6 +2836,13 @@ class RubaihBot:
                                                     f"EXTERNAL_CLOSE {closed_pair} "
                                                     f"pnl≈₹{last_pnl:.0f}",
                                                 )
+                                            if release > 0:
+                                                # External/manual flat — count toward day loss
+                                                self.risk.note_realized(last_pnl)
+                                                try:
+                                                    await self._persist_risk_state()
+                                                except Exception:
+                                                    pass
                                             await self.store.save_trade_plan({})
                                             self.portfolio.update_positions([])
                         except Exception as e:
@@ -2951,9 +3025,23 @@ class RubaihBot:
                     1.0,
                 )
                 prev_hwm = self.risk._hwm
-                violation = self.risk.check(greeks, session_pnl, capital_base)
-                # Persist HWM rises and any kill flip so restarts stay continuous
-                if violation or self.risk._hwm != prev_hwm:
+                prev_day = self.risk._day_realized
+                size_for_n, _side_n, pair_n = self._position_meta()
+                spot_n = self._mid_for(pair_n or self._active_pair) if size_for_n else 0.0
+                notional_inr = (
+                    abs(float(size_for_n)) * float(spot_n) * float(self.cycle.usdt_inr)
+                    if size_for_n and spot_n > 0
+                    else 0.0
+                )
+                violation = self.risk.check(
+                    greeks, session_pnl, capital_base, notional_inr=notional_inr
+                )
+                # Persist HWM rises, day PnL rolls, and any kill flip
+                if (
+                    violation
+                    or self.risk._hwm != prev_hwm
+                    or self.risk._day_realized != prev_day
+                ):
                     await self._persist_risk_state()
                 if violation:
                     await self._log(f"[RISK] VIOLATION: {violation}")
@@ -3308,6 +3396,11 @@ class RubaihBot:
                 entry = pos.entry_price
                 closed = min(qty, pos.size)
                 pnl = self._pnl_inr(entry, price, closed, "buy")
+                self.risk.note_realized(pnl - fee)
+                try:
+                    await self._persist_risk_state()
+                except Exception:
+                    pass
                 remain = pos.size - qty
                 if remain <= 1e-12:
                     release = float(self._margin_locked or self.cycle._margin_used or 0)

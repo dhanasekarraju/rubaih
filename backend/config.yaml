@@ -40,10 +40,16 @@ trading:
   scan_interval_sec: 5
 
   delta_threshold: 0.0005
+  # Legacy options-era limits (kept for assert/compat; futures uses ₹ caps below)
   max_delta: 100.0
   max_vega: 100.0
-  # Tighter probe kill — ~8–10% of account from peak
+  # Tighter probe kill — ~8–10% of account from peak uPnL
   max_drawdown_pct: 0.10
+  # Futures-real hard caps (authoritative for INR-M cycle)
+  # ~₹1.2k probe: one trade notional ≈ free×0.25×10x ≈ ₹3k; raise with capital
+  max_notional_inr: 12000
+  # Calendar-day (UTC) realized+unrealized loss → kill; raise toward ~₹2k at ₹20k
+  max_day_loss_inr: 200
 
   min_hedge_interval_sec: 45
   cost_buffer_multiplier: 1.2
