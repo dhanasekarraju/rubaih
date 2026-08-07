@@ -64,7 +64,8 @@ if [ -f mobile/config.js ]; then
 from pathlib import Path
 p = Path("mobile/config.js")
 text = p.read_text()
-text = text.replace("http://YOUR_VPS_IP", "http://${VPS_IP}")
+text = text.replace("http://YOUR_VPS_IP:8080", "http://${VPS_IP}:8080")
+text = text.replace("http://YOUR_VPS_IP", "http://${VPS_IP}:8080")
 text = text.replace("YOUR_RUBAIH_API_TOKEN", """${RUBAIH_API_TOKEN}""")
 p.write_text(text)
 print("mobile/config.js updated")

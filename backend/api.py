@@ -210,6 +210,12 @@ async def health():
     }
 
 
+@app.get("/health")
+async def health_root():
+    """Alias for misconfigured clients that omit /api."""
+    return await health()
+
+
 @app.get("/api/dashboard", response_model=DashboardData, dependencies=[Depends(require_token)])
 async def dashboard():
     row = await pg_pool.fetchrow(

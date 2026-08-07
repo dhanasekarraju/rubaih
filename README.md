@@ -16,7 +16,7 @@
 ## Architecture
 
 ```
-Mobile (token) → Nginx :80 → FastAPI → Redis/Postgres
+Mobile (token) → Nginx :8080 → FastAPI → Redis/Postgres
                               ↑
                          Rubaih engine → CoinDCX futures
 ```
@@ -28,8 +28,8 @@ Mobile (token) → Nginx :80 → FastAPI → Redis/Postgres
 | `LIVE_TRADING` | Must be `true` for real CoinDCX orders; otherwise dry-run logs only |
 | `RUBAIH_API_TOKEN` | Required on all API routes except `/api/health`; WS needs `?token=` |
 | Kill switch | Authenticated POST → Redis command → engine halt + flatten |
-| Risk limits | max delta / vega / drawdown → emergency unwind |
-| API bind | FastAPI published on `127.0.0.1:8000` only; public via nginx `:80` |
+| Risk limits | max drawdown / notional / day-loss → emergency unwind |
+| API bind | FastAPI on `127.0.0.1:8010` only; public via nginx `:8080` |
 
 ## Quick deploy
 
@@ -41,9 +41,9 @@ sudo bash setup-vps.sh
 
 Public endpoints after deploy:
 
-- `http://YOUR_IP/api/health` (open)
-- `http://YOUR_IP/api/dashboard` (requires `X-API-Token`)
-- `ws://YOUR_IP/ws?token=YOUR_TOKEN`
+- `http://YOUR_IP:8080/api/health` (open)
+- `http://YOUR_IP:8080/api/dashboard` (requires `X-API-Token`)
+- `ws://YOUR_IP:8080/ws?token=YOUR_TOKEN`
 
 ## Mobile / APK
 

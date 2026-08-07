@@ -266,11 +266,34 @@ export default function App() {
   const testConnection = async () => {
     try {
       const next = buildUrls(hostInput, tokenInput);
-      const res = await fetch(`${next.apiUrl}/health`);
-      const data = await res.json();
-      Alert.alert(res.ok ? 'OK' : 'Error', `status=${data.status} db=${data.db} redis=${data.redis}`);
+      if (!next.apiHost || next.apiHost.includes('YOUR_VPS_IP')) {
+        Alert.alert('Set host first', 'Use http://YOUR_VPS_IP:8080 (nginx port 8080)');
+        return;
+      }
+      const url = `${next.apiHost}/api/health`;
+      const res = await fetch(url);
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = {};
+      }
+      if (!res.ok) {
+        Alert.alert(
+          'Health failed',
+          `HTTP ${res.status} from ${url}\nIf containers are down on the VPS: docker compose ps && docker compose logs --tail=50 rubaih_api`
+        );
+        return;
+      }
+      Alert.alert(
+        data.status === 'ok' ? 'OK' : 'Degraded',
+        `${url}\nstatus=${data.status} db=${data.db} redis=${data.redis}`
+      );
     } catch (e) {
-      Alert.alert('Cannot reach VPS', String(e.message || e));
+      Alert.alert(
+        'Cannot reach VPS',
+        `${String(e.message || e)}\n\nCheck host includes :8080 and on VPS:\ndocker compose up -d\ncurl -s http://127.0.0.1:8010/api/health`
+      );
     }
   };
 
